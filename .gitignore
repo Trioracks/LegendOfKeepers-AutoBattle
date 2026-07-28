@@ -1,0 +1,14 @@
+# Build products and generated game bindings
+**/bin/
+**/obj/
+**/lib/
+**/BepInEx/
+**/dotnet/
+*.log
+*.zip
+
+# Local game analysis and saves must never be published
+**/cpp2il_*/
+**/decompiled/
+**/GameAssembly.dll
+**/global-metadata.dat
