@@ -10,8 +10,10 @@ namespace LegendOfKeepers.BattleEventInspector.Execution;
 // which does not pass through Harmony on this build.  The AUTO control is
 // therefore two native Button clones at the same position: OFF invokes the
 // built-in GameObject.SetActive(true) on ON; ON invokes SetActive(false) on
-// itself, exposing OFF beneath it.  No managed click delegate, MonoBehaviour,
-// coroutine, frame polling, input simulation, or game-speed callback exists.
+// itself, exposing OFF beneath it.  The Button.Press Harmony observation
+// records which clone was pressed before its native visibility callback. No
+// managed click delegate, MonoBehaviour, coroutine, frame polling, input
+// simulation, or game-speed callback is introduced.
 internal static class OneStepButtonController
 {
     private const string Source = "OneStepButtonController";
@@ -44,6 +46,8 @@ internal static class OneStepButtonController
     // control remains alive, causing a false OFF reading after GC.
     private static GameObject? _offObject;
     private static GameObject? _onObject;
+    private static Button? _offButton;
+    private static Button? _onButton;
     // The AUTO choice belongs to the run, rather than to a particular copy of
     // the Dungeon HUD.  The game destroys and recreates that HUD between
     // rooms/fights, so retain this choice when its native clones are rebuilt.
@@ -92,30 +96,19 @@ internal static class OneStepButtonController
     // visual state selected by the player.
     public static void RefreshLabel() { }
 
-    // This is reached only from the Harmony observation of GameObject.SetActive.
-    // The persistent UnityEvent stored in the ON button invokes SetActive(true)
-    // itself; no managed button listener, coroutine, or input emulation is
-    // introduced here.
-    public static void OnGameObjectSetActive(GameObject changedObject, bool active)
+    // This is reached from Button.Press before the clone's native persistent
+    // UnityEvent changes its visibility.  The old GameObject.SetActive observer
+    // caught activation but did not consistently catch deactivation in this
+    // IL2CPP build, leaving AUTO logically ON while its icon was OFF.
+    public static void OnAutoButtonPressed(Button pressedButton)
     {
         if (!_enabled) return;
         try
         {
-            if (!TryGetObject(_onObject, out var onObject) || onObject is null || changedObject.Pointer != onObject.Pointer) return;
-            if (_autoRequested == active) return;
-
-            _autoRequested = active;
-            if (active)
-            {
-                Emit("AutoBattleToggleEnabled", "native ON clone activation observed; attempting the current visible MonsterTurn, MasterChoice, or DisasterChoice once");
-                AutoBattleController.OnAutoToggleEnabled();
-                MasterAutoBattleController.OnAutoToggleEnabled();
-                DisasterAutoBattleController.OnAutoToggleEnabled();
-            }
-            else
-            {
-                Emit("AutoBattleToggleDisabled", "native ON clone deactivated");
-            }
+            if (SameButton(pressedButton, _onButton))
+                SetAutoBattleRequested(false, "ON clone Button.Press observed before its native SetActive(false) callback");
+            else if (SameButton(pressedButton, _offButton))
+                SetAutoBattleRequested(true, "OFF clone Button.Press observed before its native SetActive(true) callback");
         }
         catch (Exception exception)
         {
@@ -152,12 +145,17 @@ internal static class OneStepButtonController
             if (TryGetObject(_offObject, out var existingOff) && existingOff is not null &&
                 TryGetObject(_onObject, out var existingOn) && existingOn is not null)
             {
+                var existingOffButton = FindPrimaryButton(existingOff, existingOff.GetComponentsInChildren<Button>(true));
+                var existingOnButton = FindPrimaryButton(existingOn, existingOn.GetComponentsInChildren<Button>(true));
                 if (existingOff.transform.parent is not null && existingOn.transform.parent is not null &&
                     existingOff.transform.parent.Pointer == template.transform.parent.Pointer &&
                     existingOn.transform.parent.Pointer == template.transform.parent.Pointer &&
+                    existingOffButton is not null && existingOnButton is not null &&
                     TryRefreshToggleVisual(existingOff, bright: false) &&
                     TryRefreshToggleVisual(existingOn, bright: true))
                 {
+                    _offButton = existingOffButton;
+                    _onButton = existingOnButton;
                     return;
                 }
 
@@ -170,6 +168,8 @@ internal static class OneStepButtonController
                 UnityEngine.Object.Destroy(existingOn);
                 _offObject = null;
                 _onObject = null;
+                _offButton = null;
+                _onButton = null;
                 Emit("AutoBattleToggleRebuildRequired", "existing AUTO clone could not be rehydrated; rebuilding from the current native speed button");
             }
 
@@ -198,6 +198,11 @@ internal static class OneStepButtonController
                 EnableOnlyPrimaryButton(offObject);
                 EnableOnlyPrimaryButton(onObject);
 
+                var offButton = FindPrimaryButton(offObject, offObject.GetComponentsInChildren<Button>(true));
+                var onButton = FindPrimaryButton(onObject, onObject.GetComponentsInChildren<Button>(true));
+                if (offButton is null || onButton is null)
+                    throw new InvalidOperationException("AUTO toggle clone has no primary Button after configuration");
+
                 var sourceIndex = template.transform.GetSiblingIndex();
                 offObject.transform.SetSiblingIndex(sourceIndex);
                 onObject.transform.SetSiblingIndex(sourceIndex + 1);
@@ -205,12 +210,13 @@ internal static class OneStepButtonController
                 // rebuilt while AUTO is enabled, hiding OFF here would make
                 // the control disappear forever as soon as ON is clicked to
                 // turn AUTO off in the next fight.
-                offObject.SetActive(true);
-                onObject.SetActive(_autoRequested);
-
                 _offObject = offObject;
                 _onObject = onObject;
-                Emit("AutoBattleToggleConfigured", $"two native AUTO controls placed left of DungeonMain.dungeonSpeedBT at x={offObject.GetComponent<RectTransform>().anchoredPosition.x:F1}; offCallback=GameObject.SetActive(true); onCallback=GameObject.SetActive(false); retainedState={_autoRequested}");
+                _offButton = offButton;
+                _onButton = onButton;
+                offObject.SetActive(true);
+                onObject.SetActive(_autoRequested);
+                Emit("AutoBattleToggleConfigured", $"two native AUTO controls placed left of DungeonMain.dungeonSpeedBT at x={offObject.GetComponent<RectTransform>().anchoredPosition.x:F1}; offCallback=GameObject.SetActive(true); onCallback=GameObject.SetActive(false); toggleObservation=Button.Press; retainedState={_autoRequested}");
             }
             catch
             {
@@ -543,6 +549,35 @@ internal static class OneStepButtonController
         if (reference is null || reference == null) return false;
         gameObject = reference;
         return true;
+    }
+
+    private static bool SameButton(Button? left, Button? right)
+    {
+        try { return left is not null && right is not null && left != null && right != null && left.Pointer == right.Pointer; }
+        catch { return false; }
+    }
+
+    private static void SetAutoBattleRequested(bool active, string reason)
+    {
+        if (_autoRequested == active) return;
+
+        _autoRequested = active;
+        if (active)
+        {
+            Emit("AutoBattleToggleEnabled", reason + "; attempting the current visible MonsterTurn, MasterChoice, or DisasterChoice once");
+            AutoBattleController.OnAutoToggleEnabled();
+            MasterAutoBattleController.OnAutoToggleEnabled();
+            DisasterAutoBattleController.OnAutoToggleEnabled();
+            return;
+        }
+
+        // A native action already confirmed by the game cannot be rolled back
+        // safely, but no controller may retain a submission or a turn/choice
+        // reservation that could trigger a later automatic action.
+        AutoBattleController.OnAutoToggleDisabled();
+        MasterAutoBattleController.OnAutoToggleDisabled();
+        DisasterAutoBattleController.OnAutoToggleDisabled();
+        Emit("AutoBattleToggleDisabled", reason + "; cleared all AUTO controller state");
     }
 
     private static void Emit(string eventName, string reason) => ActionStateInspector.EmitResearchEvent(Source, "auto-battle-toggle", eventName, new

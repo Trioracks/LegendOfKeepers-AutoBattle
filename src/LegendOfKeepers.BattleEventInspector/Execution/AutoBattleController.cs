@@ -58,6 +58,13 @@ internal static class AutoBattleController
         OnAttackBarReady(attackBar, actor, attacks);
     }
 
+    public static void OnAutoToggleDisabled()
+    {
+        if (_submitted)
+            Emit("AutoBattleCancelledByToggle", "AUTO toggled off; an already-confirmed native attack may finish, but no later turn can be submitted");
+        ResetAll();
+    }
+
     public static void ObserveLaunchAttack(Attack attack)
     {
         if (!_submitted) return;

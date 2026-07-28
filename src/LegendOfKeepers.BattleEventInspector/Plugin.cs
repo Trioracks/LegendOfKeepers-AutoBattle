@@ -17,7 +17,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "zubko.legendofkeepers.battleeventinspector";
     public const string PluginName = "LegendOfKeepers.BattleEventInspector";
-    public const string PluginVersion = "0.6.27";
+    public const string PluginVersion = "0.6.29";
     private const string HarmonyId = "zubko.legendofkeepers.battleeventinspector.harmony";
 
     private Harmony? _harmony;
@@ -166,11 +166,11 @@ public sealed class Plugin : BasePlugin
             nameof(AttackBarTargetsPrefix),
             nameof(AttackBarTargetsPostfix));
         InstallHook("AttackBar.UnselectAttack(int)", AccessTools.Method(typeof(AttackBar), nameof(AttackBar.UnselectAttack), new[] { typeof(int) }), nameof(AttackBarUnselectPrefix), null);
-        // The AUTO control is a native persistent UnityEvent which activates
-        // its ON clone.  Observing just this one GameObject activation avoids
-        // any frame polling while also handling a click made after the attack
-        // bar has already refreshed.
-        InstallHook("UnityEngine.GameObject.SetActive(bool)", AccessTools.Method(typeof(GameObject), nameof(GameObject.SetActive), new[] { typeof(bool) }), null, nameof(GameObjectSetActivePostfix));
+        // Both AUTO visual states remain native persistent UnityEvent clones.
+        // Observe Button.Press before that event mutates visibility: the native
+        // SetActive(false) path used by the ON clone does not reliably surface
+        // through a Harmony GameObject.SetActive postfix in this IL2CPP build.
+        InstallHook("UnityEngine.UI.Button.Press()", AccessTools.Method(typeof(Button), "Press", Type.EmptyTypes), nameof(AutoBattleButtonPressPrefix), null);
     }
 
     private bool InstallHook(string displayName, MethodInfo? original, string? prefixName, string? postfixName)
@@ -264,7 +264,7 @@ public sealed class Plugin : BasePlugin
     private static void AttackBarTargetsPrefix(AttackBar __instance, Attack __0, bool __1) => RunPatch("AttackBar.GetTargetsForAttack.Prefix", () => MonsterAttackUiInspector.OnTargetsPrefix(__instance, __0, __1));
     private static void AttackBarTargetsPostfix(AttackBar __instance, Attack __0, bool __1, Il2CppSystem.Collections.Generic.List<Fighter> __result) => RunPatch("AttackBar.GetTargetsForAttack.Postfix", () => MonsterAttackUiInspector.OnTargetsPostfix(__instance, __0, __1, __result));
     private static void AttackBarUnselectPrefix(AttackBar __instance, int index) => RunPatch("AttackBar.UnselectAttack.Prefix", () => MonsterAttackUiInspector.OnUnselect(__instance, index));
-    private static void GameObjectSetActivePostfix(GameObject __instance, bool __0) => RunPatch("GameObject.SetActive.Postfix", () => OneStepButtonController.OnGameObjectSetActive(__instance, __0));
+    private static void AutoBattleButtonPressPrefix(Button __instance) => RunPatch("Button.Press.Prefix", () => OneStepButtonController.OnAutoButtonPressed(__instance));
 
     private static void RunPatch(string eventName, Action callback)
     {

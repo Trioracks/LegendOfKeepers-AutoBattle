@@ -55,6 +55,15 @@ internal static class MasterAutoBattleController
         OnSpellBarReady(_visibleBar, _visibleSpells, _visibleHeroes, _visibleSpecialSpells);
     }
 
+    public static void OnAutoToggleDisabled()
+    {
+        if (_submitted)
+            Emit("MasterAutoCancelledByToggle", "AUTO toggled off; an already-confirmed native spell may finish, but no later choice can be submitted");
+        _attemptedChoiceKey = null;
+        _submitted = false;
+        _candidate = null;
+    }
+
     public static void ObserveSpellLaunched(Spell spell)
     {
         if (!_submitted) return;

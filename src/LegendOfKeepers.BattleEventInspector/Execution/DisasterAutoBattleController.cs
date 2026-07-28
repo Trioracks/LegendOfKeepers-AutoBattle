@@ -48,6 +48,15 @@ internal static class DisasterAutoBattleController
         OnDisasterBarReady(disasterBar, disasters, heroes);
     }
 
+    public static void OnAutoToggleDisabled()
+    {
+        if (_submitted)
+            Emit("DisasterAutoCancelledByToggle", "AUTO toggled off; an already-confirmed native disaster may finish, but no later choice can be submitted");
+        _attemptedChoiceKey = null;
+        _submitted = false;
+        _candidate = null;
+    }
+
     public static void ObserveDisasterLaunched(Disaster disaster)
     {
         if (!_submitted) return;
