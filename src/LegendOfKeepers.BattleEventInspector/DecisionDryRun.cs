@@ -28,6 +28,12 @@ internal sealed record MasterPlannerDecision(ActionCandidate? Recommended, strin
 internal readonly record struct NativeMasterPreview(float HealthDamage, float MoraleDamage, int Kills, int Escapes, int TargetCount, IReadOnlyList<float> LifeAfter, IReadOnlyList<float> MoraleAfter);
 internal readonly record struct NativeMonsterPreview(float HealthDamage, float MoraleDamage, int Kills, int Escapes, int TargetCount, IReadOnlyList<float> LifeAfter, IReadOnlyList<float> MoraleAfter);
 internal readonly record struct EffectProjection(bool FullyModelled, float HealthDamage, float MoraleDamage, int Kills, int Escapes, string? Reason);
+// A target included here is already guaranteed to die or flee when its
+// currently active deterministic effects tick.  It is intentionally a
+// conservative set: unknown, random, conditional and non-periodic statuses
+// are never allowed to make AUTO abandon a target.
+internal readonly record struct ExistingPeriodicDefeatProjection(IReadOnlySet<string> TargetKeys, int LifeKills, int MoraleEscapes, IReadOnlyList<string> Notes);
+internal readonly record struct DodgeConsumptionProjection(int TargetCount, float Utility, string? Reason);
 internal readonly record struct CurrentFightProgress(float HealthUtility, float MoraleUtility, float TotalUtility);
 
 internal static class DecisionDryRun
@@ -318,8 +324,10 @@ internal static class DecisionDryRun
             return AddMasterPlannerUncertainty(candidate, "monster-damage-preview-unavailable", issue ?? "The native attack preview did not return complete values.");
         }
 
+        var existingDefeats = ProjectExistingPeriodicDefeats(actor, nativeTargets, targets);
         var effectProjection = ProjectPrimaryEffectOverTwoTargetTurns(attack, actor, nativeTargets, targets, preview);
-        return ApplyNativeMonsterPreview(candidate, preview, effectProjection);
+        var dodgeConsumption = ProjectAreaDodgeConsumption(nativeTargets, targets, preview);
+        return ApplyNativeMonsterPreview(candidate, preview, effectProjection, existingDefeats, dodgeConsumption);
     }
 
     private static bool TryReadNativeMonsterPreview(
@@ -388,6 +396,147 @@ internal static class DecisionDryRun
         preview = new NativeMonsterPreview(healthDamage, moraleDamage, kills, escapes, count, lifeAfter, moraleAfter);
         issue = null;
         return true;
+    }
+
+    // Evaluate statuses that were already on a hero before this monster's
+    // turn.  This is deliberately separate from the selected attack's own
+    // effect forecast below: otherwise a large direct hit can receive a
+    // decisive kill bonus for a hero that will certainly die from an
+    // existing Bleeding, Burning, Poison, or another deterministic DoT.
+    private static ExistingPeriodicDefeatProjection ProjectExistingPeriodicDefeats(
+        Fighter actor,
+        Il2CppSystem.Collections.Generic.List<Fighter> nativeTargets,
+        IReadOnlyList<FighterDecisionSnapshot> snapshots)
+    {
+        var targetKeys = new HashSet<string>(StringComparer.Ordinal);
+        var notes = new List<string>();
+        var lifeKills = 0;
+        var moraleEscapes = 0;
+        var count = Math.Min(nativeTargets.Count, snapshots.Count);
+        for (var index = 0; index < count; index++)
+        {
+            var target = nativeTargets[index];
+            var snapshot = snapshots[index];
+            if (target is null || !string.Equals(snapshot.Side, "hero", StringComparison.Ordinal) || snapshot.Life is not > 0 || snapshot.Morale is not > 0)
+                continue;
+
+            try
+            {
+                var holder = target.effectsOnFighter;
+                if (holder?.effects is null) continue;
+
+                var remainingLife = snapshot.Life.Value;
+                var remainingMorale = snapshot.Morale.Value;
+                var modelledStatusCount = 0;
+                for (var statusIndex = 0; statusIndex < Math.Min(holder.effects.Count, _settings!.MaxStatusesPerFighter); statusIndex++)
+                {
+                    var applied = holder.effects[statusIndex];
+                    var effect = applied?.effect;
+                    if (effect is null || TryRead(() => effect.turnLeft) <= 0 || TryRead(() => effect.randomDmgPerTurn) || HasNonPeriodicEffectPayload(effect))
+                        continue;
+
+                    // HandleEffect consumes these same fields once at the
+                    // affected fighter's next turn.  Only a plain,
+                    // deterministic component is safe to use as a reason to
+                    // stop spending a current action on this target.
+                    var turnLeft = TryRead(() => effect.turnLeft);
+                    var rawHealth = TryRead(() => effect.dmgPerTurn) + TryRead(() => effect.dmgPerTurnLeft) * turnLeft;
+                    var healthPercent = TryRead(() => effect.dmgPercentPerTurn);
+                    if (healthPercent > 0 && snapshot.MaxLife is { } maxLife) rawHealth += maxLife * healthPercent / 100f;
+                    if (rawHealth > 0 && remainingLife > 0)
+                    {
+                        var tick = DamageCalculator.CalculateDamages(target, actor, rawHealth, 1f, effect.elemType, 0f, 0f, null!, false, true);
+                        tick -= HeroPassivesManager.CheckReduceDotFromHeroPassive(target, tick);
+                        remainingLife -= Math.Max(0, tick);
+                    }
+
+                    var rawMorale = TryRead(() => effect.moralePerTurn) + TryRead(() => effect.moralePerTurnLeft) * turnLeft;
+                    var moralePercent = TryRead(() => effect.moralePercentPerTurn);
+                    if (moralePercent > 0 && snapshot.MaxMorale is { } maxMorale) rawMorale += maxMorale * moralePercent / 100f;
+                    if (rawMorale > 0 && remainingMorale > 0)
+                    {
+                        var tick = DamageCalculator.CalculateMoraleDamages(target, actor, rawMorale, 1f, true, false);
+                        remainingMorale -= Math.Max(0, tick);
+                    }
+
+                    modelledStatusCount++;
+                }
+
+                if (modelledStatusCount == 0) continue;
+                if (remainingLife <= 0)
+                {
+                    targetKeys.Add(snapshot.Key);
+                    lifeKills++;
+                    notes.Add($"{snapshot.Key} is already a deterministic DoT life kill at its next turn.");
+                }
+                else if (remainingMorale <= 0)
+                {
+                    targetKeys.Add(snapshot.Key);
+                    moraleEscapes++;
+                    notes.Add($"{snapshot.Key} is already a deterministic DoT morale escape at its next turn.");
+                }
+            }
+            catch (Exception exception)
+            {
+                // Fail open: a partially readable status must never turn a
+                // live hero into a supposedly free kill.
+                notes.Add($"Existing DoT projection skipped {snapshot.Key}: {exception.GetType().Name}.");
+            }
+        }
+
+        return new(targetKeys, lifeKills, moraleEscapes, notes);
+    }
+
+    // Evasion/IgnoreAttack is consumed by the native attack path.  A
+    // damaging area attack that also reaches another hero is therefore worth
+    // a small, explicit tactical preference: it spends the dodge while still
+    // producing output elsewhere.  Single-target attacks never get this
+    // preference, and no raw damage is invented for the evading hero.
+    private static DodgeConsumptionProjection ProjectAreaDodgeConsumption(
+        Il2CppSystem.Collections.Generic.List<Fighter> nativeTargets,
+        IReadOnlyList<FighterDecisionSnapshot> snapshots,
+        NativeMonsterPreview preview)
+    {
+        var count = Math.Min(Math.Min(nativeTargets.Count, snapshots.Count), Math.Min(preview.LifeAfter.Count, preview.MoraleAfter.Count));
+        if (count < 2) return new(0, 0, null);
+
+        var dodgeIndexes = new List<int>();
+        var damagingOtherTarget = false;
+        for (var index = 0; index < count; index++)
+        {
+            var target = nativeTargets[index];
+            if (target is null) continue;
+            var hasDodge = false;
+            try
+            {
+                var holder = target.effectsOnFighter;
+                if (holder?.effects is not null)
+                {
+                    hasDodge = Enumerable.Range(0, Math.Min(holder.effects.Count, _settings!.MaxStatusesPerFighter))
+                        .Select(statusIndex => holder.effects[statusIndex]?.effect)
+                        .Any(effect => effect is not null && TryRead(() => effect.ignoreAttack));
+                }
+            }
+            catch
+            {
+                // A missing effect holder means no reliable tactical bonus.
+                continue;
+            }
+
+            if (hasDodge)
+            {
+                dodgeIndexes.Add(index);
+                continue;
+            }
+
+            var snapshot = snapshots[index];
+            if ((snapshot.Life is { } life && preview.LifeAfter[index] < life) || (snapshot.Morale is { } morale && preview.MoraleAfter[index] < morale))
+                damagingOtherTarget = true;
+        }
+
+        if (dodgeIndexes.Count == 0 || !damagingOtherTarget) return new(0, 0, null);
+        const float utilityPerConsumedDodge = 80f;
+        return new(dodgeIndexes.Count, dodgeIndexes.Count * utilityPerConsumedDodge, $"Area attack consumes {dodgeIndexes.Count} active IgnoreAttack/Dodge effect(s) while damaging another hero.");
     }
 
     // Forecast only the exact periodic fields that the engine's HandleEffect
@@ -616,27 +765,39 @@ internal static class DecisionDryRun
         }
     }
 
-    private static ActionCandidate ApplyNativeMonsterPreview(ActionCandidate candidate, NativeMonsterPreview preview, EffectProjection effectProjection)
+    private static ActionCandidate ApplyNativeMonsterPreview(
+        ActionCandidate candidate,
+        NativeMonsterPreview preview,
+        EffectProjection effectProjection,
+        ExistingPeriodicDefeatProjection existingDefeats,
+        DodgeConsumptionProjection dodgeConsumption)
     {
         var score = candidate.Score;
-        var progress = CalculateCurrentFightProgress(candidate.Targets, preview.LifeAfter, preview.MoraleAfter);
+        // Damage dealt to a hero that will deterministically die or flee from
+        // an already active effect at its next turn is not progress earned by
+        // this action.  This lets an AOE still score its meaningful targets
+        // while a single-target overkill naturally loses to an attack that
+        // advances another hero.
+        var progress = CalculateCurrentFightProgress(candidate.Targets, preview.LifeAfter, preview.MoraleAfter, existingDefeats.TargetKeys);
         var healthUtility = progress.HealthUtility;
         var moraleUtility = progress.MoraleUtility;
         // Known periodic damage already uses the game damage helpers.  It is
         // therefore comparable on the same health/morale finish axes; no
         // legacy 0.25 morale discount is applied to AUTO.
-        var projectedEffectUtility = effectProjection.HealthDamage + effectProjection.MoraleDamage;
+        var allTargetsAlreadyResolved = candidate.Targets.Count > 0 && candidate.Targets.All(target => existingDefeats.TargetKeys.Contains(target.Key));
+        var projectedEffectUtility = allTargetsAlreadyResolved ? 0f : effectProjection.HealthDamage + effectProjection.MoraleDamage;
         // Removing a combatant is the clearest way to shorten the current
         // fight.  The direct native preview and the bounded periodic forecast
         // both contribute, while ordinary non-lethal damage remains the next
         // comparison criterion.
-        var killTieBreak = (preview.Kills + effectProjection.Kills) * 5000f;
-        var escapeTieBreak = (preview.Escapes + effectProjection.Escapes) * 5000f;
+        var immediateDefeats = CountImmediateDefeatsExcludingExistingPeriodicDefeats(candidate.Targets, preview, existingDefeats.TargetKeys);
+        var killTieBreak = (immediateDefeats.Kills + (allTargetsAlreadyResolved ? 0 : effectProjection.Kills)) * 5000f;
+        var escapeTieBreak = (immediateDefeats.Escapes + (allTargetsAlreadyResolved ? 0 : effectProjection.Escapes)) * 5000f;
         // Immediate combat output is always replaced by the game's own live
         // preview.  In particular, do not keep the former guessed status
         // score: an unknown secondary effect is worth zero to the planner,
         // never a fabricated bonus and never a reason to stop AUTO.
-        var utility = healthUtility + moraleUtility + projectedEffectUtility + killTieBreak + escapeTieBreak;
+        var utility = healthUtility + moraleUtility + projectedEffectUtility + dodgeConsumption.Utility + killTieBreak + escapeTieBreak;
         var hasKnownPeriodicComponent = effectProjection.HealthDamage > 0 || effectProjection.MoraleDamage > 0 || effectProjection.Kills > 0 || effectProjection.Escapes > 0;
         var supported = score.SupportedEffectFamilies.Append("native-monster-preview");
         if (hasKnownPeriodicComponent)
@@ -659,17 +820,36 @@ internal static class DecisionDryRun
                 UtilityMin = utility,
                 UtilityExpected = utility,
                 UtilityMax = utility,
-                StatusUtility = projectedEffectUtility,
+                StatusUtility = projectedEffectUtility + dodgeConsumption.Utility,
                 UnsupportedEffectUncertainty = score.UnsupportedEffectFamilies.Count,
                 // HIGH here means the current-turn output and target set were
                 // read from the game's native UI preview.  It does not claim
                 // to have invented a value for an unmodelled status.
                 Confidence = candidate.ConditionsNotMet.Count == 0 ? DecisionConfidence.HIGH : DecisionConfidence.MEDIUM,
-                SupportedEffectFamilies = supported.Distinct().ToArray(),
-                Warnings = score.Warnings.Append("Direct damage and morale are summed over every target from the game's native AttackBar preview.").Append("Unmodelled effects contribute zero strategic utility but do not block the native action.").Append(effectWarning).Distinct().ToArray(),
-                Notes = score.Notes.Append($"native-monster-preview targets={preview.TargetCount} healthDamage={preview.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={preview.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} healthProgress={progress.HealthUtility.ToString("0.##", CultureInfo.InvariantCulture)} moraleProgress={progress.MoraleUtility.ToString("0.##", CultureInfo.InvariantCulture)} kills={preview.Kills} escapes={preview.Escapes}").Append($"two-target-turn-effect healthDamage={effectProjection.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={effectProjection.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} kills={effectProjection.Kills} escapes={effectProjection.Escapes} fullyModelled={effectProjection.FullyModelled}").ToArray(),
+                SupportedEffectFamilies = (dodgeConsumption.TargetCount > 0 ? supported.Append("area-dodge-consumption") : supported).Distinct().ToArray(),
+                Warnings = score.Warnings.Append("Direct damage and morale are summed over every target from the game's native AttackBar preview.").Append("Unmodelled effects contribute zero strategic utility but do not block the native action.").Append(effectWarning).Concat(existingDefeats.Notes).Append(dodgeConsumption.Reason ?? string.Empty).Where(message => !string.IsNullOrWhiteSpace(message)).Distinct().ToArray(),
+                Notes = score.Notes.Append($"native-monster-preview targets={preview.TargetCount} healthDamage={preview.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={preview.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} healthProgress={progress.HealthUtility.ToString("0.##", CultureInfo.InvariantCulture)} moraleProgress={progress.MoraleUtility.ToString("0.##", CultureInfo.InvariantCulture)} kills={immediateDefeats.Kills} escapes={immediateDefeats.Escapes} existingPeriodicDefeats={existingDefeats.TargetKeys.Count}").Append($"two-target-turn-effect healthDamage={effectProjection.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={effectProjection.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} kills={effectProjection.Kills} escapes={effectProjection.Escapes} fullyModelled={effectProjection.FullyModelled} dodgeConsumptionUtility={dodgeConsumption.Utility.ToString("0.##", CultureInfo.InvariantCulture)}").ToArray(),
             },
         };
+    }
+
+    private static (int Kills, int Escapes) CountImmediateDefeatsExcludingExistingPeriodicDefeats(
+        IReadOnlyList<FighterDecisionSnapshot> targets,
+        NativeMonsterPreview preview,
+        IReadOnlySet<string> existingPeriodicDefeatKeys)
+    {
+        var kills = 0;
+        var escapes = 0;
+        var count = Math.Min(targets.Count, Math.Min(preview.LifeAfter.Count, preview.MoraleAfter.Count));
+        for (var index = 0; index < count; index++)
+        {
+            var target = targets[index];
+            if (existingPeriodicDefeatKeys.Contains(target.Key)) continue;
+            if (target.Life is > 0 && preview.LifeAfter[index] <= 0) kills++;
+            if (target.Morale is > 0 && preview.MoraleAfter[index] <= 0) escapes++;
+        }
+
+        return (kills, escapes);
     }
 
     // A hero leaves the fight through either zero life or zero morale.  Raw
@@ -681,7 +861,8 @@ internal static class DecisionDryRun
     private static CurrentFightProgress CalculateCurrentFightProgress(
         IReadOnlyList<FighterDecisionSnapshot> targets,
         IReadOnlyList<float> lifeAfter,
-        IReadOnlyList<float> moraleAfter)
+        IReadOnlyList<float> moraleAfter,
+        IReadOnlySet<string>? excludedTargetKeys = null)
     {
         var health = 0f;
         var morale = 0f;
@@ -690,6 +871,7 @@ internal static class DecisionDryRun
         {
             var target = targets[index];
             if (!string.Equals(target.Side, "hero", StringComparison.Ordinal)) continue;
+            if (excludedTargetKeys?.Contains(target.Key) == true) continue;
 
             var healthProgress = target.Life is > 0
                 ? Math.Clamp((target.Life.Value - lifeAfter[index]) / target.Life.Value, 0f, 1f)

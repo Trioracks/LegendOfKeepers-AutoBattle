@@ -4,7 +4,7 @@
     <TargetFramework>net6.0</TargetFramework>
     <AssemblyName>LegendOfKeepers.BattleEventInspector</AssemblyName>
     <Description>Confidence-gated monster single-step execution research for Legend of Keepers</Description>
-    <Version>0.6.27</Version>
+    <Version>0.6.28</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
