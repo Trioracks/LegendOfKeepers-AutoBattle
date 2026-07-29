@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.30
+
+- Added a conservative one-room trap horizon for monster AUTO. When the next room is a fully known normal AOE trap, AUTO can leave a hero alive only if that trap deterministically defeats the hero.
+- The proof includes direct damage/morale, elemental resistance, trap-reduction passives, a pure periodic trap effect, effect immunity/dodge, effect-stack reduction, static trap artefact/talent amplification, and queued next-trap effects from living monsters' death passives.
+- Conditional, random, special, bounce, multi-trap, and unrecognised queued effects are fail-open: AUTO keeps treating the hero as a current target.
+
 ## v0.6.29
 
 - Исправлено выключение AUTO: нажатие яркой иконки теперь фиксируется до

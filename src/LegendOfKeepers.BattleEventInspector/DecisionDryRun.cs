@@ -33,6 +33,10 @@ internal readonly record struct EffectProjection(bool FullyModelled, float Healt
 // conservative set: unknown, random, conditional and non-periodic statuses
 // are never allowed to make AUTO abandon a target.
 internal readonly record struct ExistingPeriodicDefeatProjection(IReadOnlySet<string> TargetKeys, int LifeKills, int MoraleEscapes, IReadOnlyList<string> Notes);
+// A future target appears here only after the route/trap evaluator proved a
+// deterministic defeat in the immediately following ordinary trap room.
+// It is kept separate from an existing DoT: the native current-room preview
+// must still receive full kill credit when it ends the hero now.
 internal readonly record struct DodgeConsumptionProjection(int TargetCount, float Utility, string? Reason);
 internal readonly record struct CurrentFightProgress(float HealthUtility, float MoraleUtility, float TotalUtility);
 
@@ -139,7 +143,7 @@ internal static class DecisionDryRun
             {
                 var attack = attacks[index];
                 if (attack is null) continue;
-                candidates.Add(BuildMonsterAttackCandidate(baseContext, attackBar, actor, attack));
+                candidates.Add(BuildMonsterAttackCandidate(baseContext, manager, attackBar, actor, attack));
             }
 
             var recommended = SelectMonsterRecommendation(candidates);
@@ -286,7 +290,7 @@ internal static class DecisionDryRun
         });
     }
 
-    private static ActionCandidate BuildMonsterAttackCandidate(DecisionContext baseContext, AttackBar attackBar, Fighter actor, Attack attack)
+    private static ActionCandidate BuildMonsterAttackCandidate(DecisionContext baseContext, FightManager manager, AttackBar attackBar, Fighter actor, Attack attack)
     {
         var descriptor = DescribeAttack(attack);
         // Do not reject a visible action merely because its target routing is
@@ -325,9 +329,10 @@ internal static class DecisionDryRun
         }
 
         var existingDefeats = ProjectExistingPeriodicDefeats(actor, nativeTargets, targets);
+        var futureTrapDefeats = RouteTrapForecast.Project(manager, actor, nativeTargets, targets, preview, _settings!);
         var effectProjection = ProjectPrimaryEffectOverTwoTargetTurns(attack, actor, nativeTargets, targets, preview);
         var dodgeConsumption = ProjectAreaDodgeConsumption(nativeTargets, targets, preview);
-        return ApplyNativeMonsterPreview(candidate, preview, effectProjection, existingDefeats, dodgeConsumption);
+        return ApplyNativeMonsterPreview(candidate, preview, effectProjection, existingDefeats, futureTrapDefeats, dodgeConsumption);
     }
 
     private static bool TryReadNativeMonsterPreview(
@@ -726,7 +731,7 @@ internal static class DecisionDryRun
     // morale-over-time status.  Any extra branch below affects an attack,
     // defence, turn order, future group, or random outcome and therefore
     // remains manual until it has a dedicated evaluator.
-    private static bool HasNonPeriodicEffectPayload(Effect effect)
+    internal static bool HasNonPeriodicEffectPayload(Effect effect)
     {
         try
         {
@@ -770,6 +775,7 @@ internal static class DecisionDryRun
         NativeMonsterPreview preview,
         EffectProjection effectProjection,
         ExistingPeriodicDefeatProjection existingDefeats,
+        FutureTrapDefeatProjection futureTrapDefeats,
         DodgeConsumptionProjection dodgeConsumption)
     {
         var score = candidate.Score;
@@ -778,19 +784,21 @@ internal static class DecisionDryRun
         // this action.  This lets an AOE still score its meaningful targets
         // while a single-target overkill naturally loses to an attack that
         // advances another hero.
-        var progress = CalculateCurrentFightProgress(candidate.Targets, preview.LifeAfter, preview.MoraleAfter, existingDefeats.TargetKeys);
+        var resolvedTargetKeys = new HashSet<string>(existingDefeats.TargetKeys, StringComparer.Ordinal);
+        resolvedTargetKeys.UnionWith(futureTrapDefeats.TargetKeys);
+        var progress = CalculateCurrentFightProgress(candidate.Targets, preview.LifeAfter, preview.MoraleAfter, resolvedTargetKeys);
         var healthUtility = progress.HealthUtility;
         var moraleUtility = progress.MoraleUtility;
         // Known periodic damage already uses the game damage helpers.  It is
         // therefore comparable on the same health/morale finish axes; no
         // legacy 0.25 morale discount is applied to AUTO.
-        var allTargetsAlreadyResolved = candidate.Targets.Count > 0 && candidate.Targets.All(target => existingDefeats.TargetKeys.Contains(target.Key));
+        var allTargetsAlreadyResolved = candidate.Targets.Count > 0 && candidate.Targets.All(target => resolvedTargetKeys.Contains(target.Key));
         var projectedEffectUtility = allTargetsAlreadyResolved ? 0f : effectProjection.HealthDamage + effectProjection.MoraleDamage;
         // Removing a combatant is the clearest way to shorten the current
         // fight.  The direct native preview and the bounded periodic forecast
         // both contribute, while ordinary non-lethal damage remains the next
         // comparison criterion.
-        var immediateDefeats = CountImmediateDefeatsExcludingExistingPeriodicDefeats(candidate.Targets, preview, existingDefeats.TargetKeys);
+        var immediateDefeats = CountImmediateDefeatsExcludingExistingPeriodicDefeats(candidate.Targets, preview, resolvedTargetKeys);
         var killTieBreak = (immediateDefeats.Kills + (allTargetsAlreadyResolved ? 0 : effectProjection.Kills)) * 5000f;
         var escapeTieBreak = (immediateDefeats.Escapes + (allTargetsAlreadyResolved ? 0 : effectProjection.Escapes)) * 5000f;
         // Immediate combat output is always replaced by the game's own live
@@ -825,10 +833,10 @@ internal static class DecisionDryRun
                 // HIGH here means the current-turn output and target set were
                 // read from the game's native UI preview.  It does not claim
                 // to have invented a value for an unmodelled status.
-                Confidence = candidate.ConditionsNotMet.Count == 0 ? DecisionConfidence.HIGH : DecisionConfidence.MEDIUM,
-                SupportedEffectFamilies = (dodgeConsumption.TargetCount > 0 ? supported.Append("area-dodge-consumption") : supported).Distinct().ToArray(),
-                Warnings = score.Warnings.Append("Direct damage and morale are summed over every target from the game's native AttackBar preview.").Append("Unmodelled effects contribute zero strategic utility but do not block the native action.").Append(effectWarning).Concat(existingDefeats.Notes).Append(dodgeConsumption.Reason ?? string.Empty).Where(message => !string.IsNullOrWhiteSpace(message)).Distinct().ToArray(),
-                Notes = score.Notes.Append($"native-monster-preview targets={preview.TargetCount} healthDamage={preview.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={preview.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} healthProgress={progress.HealthUtility.ToString("0.##", CultureInfo.InvariantCulture)} moraleProgress={progress.MoraleUtility.ToString("0.##", CultureInfo.InvariantCulture)} kills={immediateDefeats.Kills} escapes={immediateDefeats.Escapes} existingPeriodicDefeats={existingDefeats.TargetKeys.Count}").Append($"two-target-turn-effect healthDamage={effectProjection.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={effectProjection.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} kills={effectProjection.Kills} escapes={effectProjection.Escapes} fullyModelled={effectProjection.FullyModelled} dodgeConsumptionUtility={dodgeConsumption.Utility.ToString("0.##", CultureInfo.InvariantCulture)}").ToArray(),
+                Confidence = candidate.ConditionsNotMet.Count == 0 && futureTrapDefeats.TargetKeys.Count == 0 ? DecisionConfidence.HIGH : DecisionConfidence.MEDIUM,
+                SupportedEffectFamilies = (futureTrapDefeats.TargetKeys.Count > 0 ? supported.Append("one-room-trap-horizon") : supported).Append(dodgeConsumption.TargetCount > 0 ? "area-dodge-consumption" : string.Empty).Where(family => !string.IsNullOrWhiteSpace(family)).Distinct().ToArray(),
+                Warnings = score.Warnings.Append("Direct damage and morale are summed over every target from the game's native AttackBar preview.").Append("Unmodelled effects contribute zero strategic utility but do not block the native action.").Append(effectWarning).Concat(existingDefeats.Notes).Concat(futureTrapDefeats.Notes).Append(dodgeConsumption.Reason ?? string.Empty).Where(message => !string.IsNullOrWhiteSpace(message)).Distinct().ToArray(),
+                Notes = score.Notes.Append($"native-monster-preview targets={preview.TargetCount} healthDamage={preview.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={preview.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} healthProgress={progress.HealthUtility.ToString("0.##", CultureInfo.InvariantCulture)} moraleProgress={progress.MoraleUtility.ToString("0.##", CultureInfo.InvariantCulture)} kills={immediateDefeats.Kills} escapes={immediateDefeats.Escapes} existingPeriodicDefeats={existingDefeats.TargetKeys.Count} futureTrapDefeats={futureTrapDefeats.TargetKeys.Count}").Append($"two-target-turn-effect healthDamage={effectProjection.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={effectProjection.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} kills={effectProjection.Kills} escapes={effectProjection.Escapes} fullyModelled={effectProjection.FullyModelled} futureTrapLifeKills={futureTrapDefeats.LifeKills} futureTrapMoraleEscapes={futureTrapDefeats.MoraleEscapes} dodgeConsumptionUtility={dodgeConsumption.Utility.ToString("0.##", CultureInfo.InvariantCulture)}").ToArray(),
             },
         };
     }
@@ -1694,7 +1702,13 @@ internal static class DecisionDryRun
         {
             Score = winner.Score with
             {
-                Confidence = fallbackRoute ? DecisionConfidence.MEDIUM : DecisionConfidence.HIGH,
+                // The current hit itself remains native-preview exact, but a
+                // winner whose score reserved a target for the next trap is
+                // intentionally marked MEDIUM until a runtime trace confirms
+                // that route and trap ordering for this game build.
+                Confidence = fallbackRoute || winner.Score.Confidence != DecisionConfidence.HIGH
+                    ? DecisionConfidence.MEDIUM
+                    : DecisionConfidence.HIGH,
                 Warnings = warnings,
             },
         };

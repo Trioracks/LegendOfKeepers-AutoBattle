@@ -17,7 +17,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "zubko.legendofkeepers.battleeventinspector";
     public const string PluginName = "LegendOfKeepers.BattleEventInspector";
-    public const string PluginVersion = "0.6.29";
+    public const string PluginVersion = "0.6.30";
     private const string HarmonyId = "zubko.legendofkeepers.battleeventinspector.harmony";
 
     private Harmony? _harmony;
@@ -42,7 +42,7 @@ public sealed class Plugin : BasePlugin
             Log.LogInfo($"BepInEx version: {GetBepInExVersion()}");
             Log.LogInfo($"Process architecture: {(Environment.Is64BitProcess ? "x64" : "x86")}");
             Log.LogInfo("BattleEventInspector loaded");
-            Log.LogInfo($"Execution mode: {settings.ExecutionMode}; legacy native UI confirmation: {settings.RuntimePathConfirmed}; AUTO monster execution: {settings.AutoBattleMonsterExecutionEnabled}; AUTO master-spell execution: {settings.AutoBattleMasterSpellExecutionEnabled}; AUTO disaster execution: {settings.AutoBattleDisasterExecutionEnabled}; AUTO toggle: {settings.OneStepButtonEnabled}");
+            Log.LogInfo($"Execution mode: {settings.ExecutionMode}; legacy native UI confirmation: {settings.RuntimePathConfirmed}; AUTO monster execution: {settings.AutoBattleMonsterExecutionEnabled}; one-room trap horizon: {settings.RouteTrapHorizonEnabled}; AUTO master-spell execution: {settings.AutoBattleMasterSpellExecutionEnabled}; AUTO disaster execution: {settings.AutoBattleDisasterExecutionEnabled}; AUTO toggle: {settings.OneStepButtonEnabled}");
             Log.LogInfo("AUTO uses revalidated native UI callbacks for MonsterTurn, MasterChoice, and DisasterChoice when the top-right toggle is ON.");
             Log.LogInfo($"Master spell planner: {settings.MasterSpellPlanningEnabled}; AUTO prefers current-battle native previews and leaves deferred effects as fallback.");
             Log.LogInfo("Effect research: reads GameModel effect definitions and observes manual action results; it never selects or submits an action.");
@@ -313,6 +313,7 @@ internal sealed record InspectorSettings(
     int ExecutionWatchdogSeconds,
     bool OneStepButtonEnabled,
     bool AutoBattleMonsterExecutionEnabled,
+    bool RouteTrapHorizonEnabled,
     bool EffectDefinitionLogging,
     bool MasterSpellPlanningEnabled,
     bool AutoBattleMasterSpellExecutionEnabled,
@@ -348,6 +349,7 @@ internal sealed record InspectorSettings(
             Math.Clamp(config.Bind("Execution", "WatchdogSeconds", 15, "Fail-open timeout; never retries an action.").Value, 1, 60),
             config.Bind("Execution", "OneStepButtonEnabled", false, "Show the native AUTO toggle at the top right.").Value,
             config.Bind("AutoBattle", "MonsterExecutionEnabled", true, "When AUTO is ON, select one visible MonsterTurn tile using native current-state previews and the game's callback. Unknown effects are neutral rather than blocked. Master spells remain manual.").Value,
+            config.Bind("AutoBattle", "RouteTrapHorizonEnabled", true, "Use only deterministic defeats from the immediately following normal AOE trap room to avoid redundant current-room finishes. Conditional, random, special, and unresolved trap mechanics are ignored.").Value,
             config.Bind("Research", "EffectDefinitionLogging", true, "Read and log the definitions of effects referenced by visible monster attacks. Never changes game state.").Value,
             config.Bind("MasterSpellPlanner", "Enabled", true, "Read native spell previews to rank direct current-battle damage.").Value,
             config.Bind("AutoBattle", "MasterSpellExecutionEnabled", true, "When AUTO is ON, choose one MasterChoice spell through the native SpellBar tile callback. Current-battle damage/morale is preferred; deferred next-group spells are fallback only.").Value,

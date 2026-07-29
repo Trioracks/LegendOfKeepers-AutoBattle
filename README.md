@@ -5,8 +5,8 @@
 
 ## Скачать
 
-Скачайте файл `LegendOfKeepers_AutoBattle_v0.6.29_TESTERS.zip` из
-[релиза v0.6.29](https://github.com/Trioracks/LegendOfKeepers-AutoBattle/releases/tag/v0.6.29).
+Скачайте файл `LegendOfKeepers_AutoBattle_v0.6.30_TESTERS.zip` из
+[релиза v0.6.30](https://github.com/Trioracks/LegendOfKeepers-AutoBattle/releases/tag/v0.6.30).
 
 Это тестовая версия. Она не содержит игру, Steam, сохранения или игровые DLL.
 
@@ -65,7 +65,7 @@
 
 ## Технически
 
-- версия плагина: `0.6.29`;
+- версия плагина: `0.6.30`;
 - GUID: `zubko.legendofkeepers.battleeventinspector`;
 - BepInEx IL2CPP x86: `6.0.0-be.785`;
 - целевая версия Unity: `2019.4.18f1`;
