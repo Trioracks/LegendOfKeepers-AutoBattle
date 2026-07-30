@@ -27,7 +27,12 @@ internal sealed record DisasterUiDecision(ActionCandidate? Recommended, IReadOnl
 internal sealed record MasterPlannerDecision(ActionCandidate? Recommended, string? Question);
 internal readonly record struct NativeMasterPreview(float HealthDamage, float MoraleDamage, int Kills, int Escapes, int TargetCount, IReadOnlyList<float> LifeAfter, IReadOnlyList<float> MoraleAfter);
 internal readonly record struct NativeMonsterPreview(float HealthDamage, float MoraleDamage, int Kills, int Escapes, int TargetCount, IReadOnlyList<float> LifeAfter, IReadOnlyList<float> MoraleAfter);
-internal readonly record struct EffectProjection(bool FullyModelled, float HealthDamage, float MoraleDamage, int Kills, int Escapes, string? Reason);
+// Health/morale totals are retained for diagnostics. ProgressUtility is the
+// target-relative progress caused by a status after the action lands; raw DoT
+// values are intentionally not used to compare health and morale finish axes.
+internal readonly record struct EffectProjection(bool FullyModelled, float HealthDamage, float MoraleDamage, float ProgressUtility, int Kills, int Escapes, string? Reason);
+internal readonly record struct StrategicSetupProjection(bool FullyModelled, float Utility, string? Reason);
+internal readonly record struct PeriodicEffectApplication(int EffectId, int AddedTurns, float Chance, string Source);
 // A target included here is already guaranteed to die or flee when its
 // currently active deterministic effects tick.  It is intentionally a
 // conservative set: unknown, random, conditional and non-periodic statuses
@@ -143,7 +148,7 @@ internal static class DecisionDryRun
             {
                 var attack = attacks[index];
                 if (attack is null) continue;
-                candidates.Add(BuildMonsterAttackCandidate(baseContext, manager, attackBar, actor, attack));
+                candidates.Add(BuildMonsterAttackCandidate(baseContext, manager, attackBar, actor, attack, attacks));
             }
 
             var recommended = SelectMonsterRecommendation(candidates);
@@ -290,7 +295,7 @@ internal static class DecisionDryRun
         });
     }
 
-    private static ActionCandidate BuildMonsterAttackCandidate(DecisionContext baseContext, FightManager manager, AttackBar attackBar, Fighter actor, Attack attack)
+    private static ActionCandidate BuildMonsterAttackCandidate(DecisionContext baseContext, FightManager manager, AttackBar attackBar, Fighter actor, Attack attack, IReadOnlyList<Attack> availableAttacks)
     {
         var descriptor = DescribeAttack(attack);
         // Do not reject a visible action merely because its target routing is
@@ -331,8 +336,11 @@ internal static class DecisionDryRun
         var existingDefeats = ProjectExistingPeriodicDefeats(actor, nativeTargets, targets);
         var futureTrapDefeats = RouteTrapForecast.Project(manager, actor, nativeTargets, targets, preview, _settings!);
         var effectProjection = ProjectPrimaryEffectOverTwoTargetTurns(attack, actor, nativeTargets, targets, preview);
+        var passiveProjection = ProjectDistinctMonsterPassiveEffectsOverTwoTargetTurns(attack, actor, nativeTargets, targets, preview);
+        var artefactProjection = ProjectMoraleAttackArtefactEffects(attack, actor, nativeTargets, targets, preview);
+        var setupProjection = ProjectFutureDamageAmplification(attackBar, attack, availableAttacks, actor, nativeTargets, targets, preview);
         var dodgeConsumption = ProjectAreaDodgeConsumption(nativeTargets, targets, preview);
-        return ApplyNativeMonsterPreview(candidate, preview, effectProjection, existingDefeats, futureTrapDefeats, dodgeConsumption);
+        return ApplyNativeMonsterPreview(candidate, preview, effectProjection, passiveProjection, artefactProjection, setupProjection, existingDefeats, futureTrapDefeats, dodgeConsumption);
     }
 
     private static bool TryReadNativeMonsterPreview(
@@ -555,7 +563,7 @@ internal static class DecisionDryRun
         NativeMonsterPreview preview)
     {
         var effectId = TryRead(() => attack.effectId);
-        if (effectId <= 0) return new(true, 0, 0, 0, 0, null);
+        if (effectId <= 0) return new(true, 0, 0, 0, 0, 0, null);
 
         // A primary status can only be treated as deterministic when it is
         // the whole status payload of the action.  Conditional and secondary
@@ -563,13 +571,13 @@ internal static class DecisionDryRun
         // current-battle evaluator.
         if (HasConditionalOrSecondaryEffectRoute(attack))
         {
-            return new(false, 0, 0, 0, 0, $"Attack {TryRead(() => attack.id)} has a secondary or conditional effect route.");
+            return new(false, 0, 0, 0, 0, 0, $"Attack {TryRead(() => attack.id)} has a secondary or conditional effect route.");
         }
 
         var chance = TryRead(() => attack.effectChancePercent);
         if (chance is > 0 and < 100)
         {
-            return new(false, 0, 0, 0, 0, $"Effect {effectId} has {chance}% application chance; RNG is not used to select an action.");
+            return new(false, 0, 0, 0, 0, 0, $"Effect {effectId} has {chance}% application chance; RNG is not used to select an action.");
         }
 
         Effect? effect;
@@ -580,17 +588,18 @@ internal static class DecisionDryRun
         }
         catch (Exception exception)
         {
-            return new(false, 0, 0, 0, 0, $"Effect {effectId} definition could not be read: {exception.GetType().Name}.");
+            return new(false, 0, 0, 0, 0, 0, $"Effect {effectId} definition could not be read: {exception.GetType().Name}.");
         }
 
-        if (effect is null) return new(false, 0, 0, 0, 0, $"Effect {effectId} definition is unavailable.");
+        if (effect is null) return new(false, 0, 0, 0, 0, 0, $"Effect {effectId} definition is unavailable.");
         var requestedTurns = TryRead(() => attack.nbEffectStack);
         var definitionTurns = TryRead(() => effect.nbTurn);
         var baseAddedTurnLeft = Math.Max(0, requestedTurns > 0 ? requestedTurns : definitionTurns);
-        if (baseAddedTurnLeft == 0) return new(false, 0, 0, 0, 0, $"Effect {effectId} has no positive duration to project.");
+        if (baseAddedTurnLeft == 0) return new(false, 0, 0, 0, 0, 0, $"Effect {effectId} has no positive duration to project.");
 
         var health = 0f;
         var morale = 0f;
+        var progressUtility = 0f;
         var kills = 0;
         var escapes = 0;
         var immuneTargets = 0;
@@ -602,7 +611,7 @@ internal static class DecisionDryRun
         {
             if (preview.LifeAfter[index] <= 0) continue;
             var target = nativeTargets[index];
-            if (target is null) return new(false, health, morale, kills, escapes, $"Effect {effectId} target reference is unavailable.");
+            if (target is null) return new(false, health, morale, progressUtility, kills, escapes, $"Effect {effectId} target reference is unavailable.");
             try
             {
                 // This is the same target-side gate used by Fighter.AddEffect.
@@ -688,10 +697,15 @@ internal static class DecisionDryRun
                     remainingMorale -= dealt;
                     if (remainingMorale <= 0) escapes++;
                 }
+
+                var directProgress = CalculateTargetFightProgress(snapshots[index], preview.LifeAfter[index], preview.MoraleAfter[index]);
+                var projectedProgress = CalculateTargetFightProgress(snapshots[index], remainingLife, remainingMorale);
+                // Do not compare raw health and morale values.  Credit only
+                // the additional depletion of the target's faster exit axis.
             }
             catch (Exception exception)
             {
-                return new(false, health, morale, kills, escapes, $"Effect {effectId} periodic preview failed open: {exception.GetType().Name}.");
+                return new(false, health, morale, progressUtility, kills, escapes, $"Effect {effectId} periodic preview failed open: {exception.GetType().Name}.");
             }
         }
 
@@ -700,10 +714,386 @@ internal static class DecisionDryRun
         if (health == 0 && morale == 0)
         {
             var immunityReason = immuneTargets > 0 ? $" Effect {effectId} is blocked by target immunity." : string.Empty;
-            return new(false, 0, 0, 0, 0, $"Effect {effectId} has no autonomous periodic damage in its definition; conditional malus/control value is not guessed.{immunityReason}{modifierSummary}");
+            return new(false, 0, 0, 0, 0, 0, $"Effect {effectId} has no autonomous periodic damage in its definition; conditional malus/control value is not guessed.{immunityReason}{modifierSummary}");
         }
 
-        return new(!hasUnmodelledPayload, health, morale, kills, escapes, hasUnmodelledPayload ? $"Effect {effectId} also has non-periodic or distinct passive payload that remains manual.{modifierSummary}" : $"Effect {effectId} forecast used live immunity, passive and artefact stack modifiers.{modifierSummary}");
+        return new(!hasUnmodelledPayload, health, morale, progressUtility, kills, escapes, hasUnmodelledPayload ? $"Effect {effectId} also has non-periodic or distinct passive payload that remains manual.{modifierSummary}" : $"Effect {effectId} forecast used live immunity, passive and artefact stack modifiers.{modifierSummary}");
+    }
+
+    // Monster passives are evaluated by the game for the concrete native
+    // target route.  A different passive status (for example Vampire's
+    // Bleeding) used to be logged but assigned zero utility.  Forecast its
+    // deterministic periodic part separately instead of pretending it is the
+    // visible primary effect.
+    private static EffectProjection ProjectDistinctMonsterPassiveEffectsOverTwoTargetTurns(
+        Attack attack,
+        Fighter actor,
+        Il2CppSystem.Collections.Generic.List<Fighter> nativeTargets,
+        IReadOnlyList<FighterDecisionSnapshot> snapshots,
+        NativeMonsterPreview preview)
+    {
+        var primaryEffectId = TryRead(() => attack.effectId);
+        return ProjectPeriodicEffectApplications(actor, nativeTargets, snapshots, preview, index =>
+        {
+            var target = nativeTargets[index];
+            if (target is null) return null;
+            var passive = actor.CheckAddEffectOnAttackFromMonsterPassive(target);
+            if (passive.x <= 0 || passive.y <= 0 || passive.x == primaryEffectId) return null;
+            var additionalStacks = passive.y + target.GetAddEffectStackBonus(passive.x, actor, true);
+            return new PeriodicEffectApplication(passive.x, Math.Max(0, additionalStacks), 1f, "monster-passive");
+        }, "monster passive");
+    }
+
+    // Artefacts can add a status after every monster morale attack.  The game
+    // rolls independently for every affected hero, so an AOE receives the
+    // expected value of each legal target rather than a one-time global bonus.
+    private static EffectProjection ProjectMoraleAttackArtefactEffects(
+        Attack attack,
+        Fighter actor,
+        Il2CppSystem.Collections.Generic.List<Fighter> nativeTargets,
+        IReadOnlyList<FighterDecisionSnapshot> snapshots,
+        NativeMonsterPreview preview)
+    {
+        if (preview.MoraleDamage <= 0) return EmptyEffectProjection(true, null);
+
+        var total = EmptyEffectProjection(true, null);
+        var artefacts = ReadActiveArtefacts();
+        var modelledArtefactCount = 0;
+        for (var artefactIndex = 0; artefactIndex < artefacts.Count; artefactIndex++)
+        {
+            var artefact = artefacts[artefactIndex];
+            var effectId = TryRead(() => artefact.effectIdOnMoraleMonsterAttack);
+            var chancePercent = Math.Clamp(TryRead(() => artefact.GetEffectOnMoraleMonsterAttackPercent()), 0, 100);
+            if (effectId <= 0 || chancePercent <= 0) continue;
+
+            modelledArtefactCount++;
+            var projection = ProjectPeriodicEffectApplications(actor, nativeTargets, snapshots, preview, index =>
+            {
+                var beforeMorale = snapshots[index].Morale;
+                if (beforeMorale is not > 0 || index >= preview.MoraleAfter.Count || preview.MoraleAfter[index] >= beforeMorale.Value)
+                    return null;
+
+                return new PeriodicEffectApplication(effectId, 0, chancePercent / 100f, $"artefact:{TryRead(() => artefact.id)}");
+            }, $"artefact morale-attack effect {effectId}");
+            total = CombineEffectProjections(total, projection);
+        }
+
+        return modelledArtefactCount == 0
+            ? EmptyEffectProjection(true, "No active artefact adds a status to monster morale attacks.")
+            : total;
+    }
+
+    private static IReadOnlyList<Artefact> ReadActiveArtefacts()
+    {
+        try
+        {
+            var equipped = DungeonMain.instance?.ArtefactsEquippedModal?.artefactEquippedList;
+            if (equipped is null) return Array.Empty<Artefact>();
+            return Enumerable.Range(0, Math.Min(equipped.Count, _settings!.MaxCollectionItems))
+                .Select(index => equipped[index])
+                .Where(item => item is not null && item.isActive && item.artefact is not null)
+                .Select(item => item.artefact)
+                .ToArray();
+        }
+        catch
+        {
+            // Artefact UI data is optional outside a dungeon.  No artefact
+            // value is safer than inventing an unequipped one.
+            return Array.Empty<Artefact>();
+        }
+    }
+
+    private static EffectProjection EmptyEffectProjection(bool fullyModelled, string? reason) =>
+        new(fullyModelled, 0f, 0f, 0f, 0, 0, reason);
+
+    private static EffectProjection CombineEffectProjections(EffectProjection left, EffectProjection right)
+    {
+        var reason = string.Join(" ", new[] { left.Reason, right.Reason }.Where(text => !string.IsNullOrWhiteSpace(text)).Distinct());
+        return new(left.FullyModelled && right.FullyModelled,
+            left.HealthDamage + right.HealthDamage,
+            left.MoraleDamage + right.MoraleDamage,
+            left.ProgressUtility + right.ProgressUtility,
+            left.Kills + right.Kills,
+            left.Escapes + right.Escapes,
+            string.IsNullOrWhiteSpace(reason) ? null : reason);
+    }
+
+    // This shared projection intentionally covers only the exact deterministic
+    // periodic fields consumed by Fighter.HandleEffect.  It supplies expected
+    // value for a chance-based artefact but grants an actual defeat bonus only
+    // for a guaranteed application.
+    private static EffectProjection ProjectPeriodicEffectApplications(
+        Fighter actor,
+        Il2CppSystem.Collections.Generic.List<Fighter> nativeTargets,
+        IReadOnlyList<FighterDecisionSnapshot> snapshots,
+        NativeMonsterPreview preview,
+        Func<int, PeriodicEffectApplication?> applicationForTarget,
+        string source)
+    {
+        var health = 0f;
+        var morale = 0f;
+        var progress = 0f;
+        var kills = 0;
+        var escapes = 0;
+        var fullyModelled = true;
+        var anyApplication = false;
+        var notes = new List<string>();
+        var count = Math.Min(Math.Min(nativeTargets.Count, snapshots.Count), Math.Min(preview.LifeAfter.Count, preview.MoraleAfter.Count));
+
+        for (var index = 0; index < count; index++)
+        {
+            if (preview.LifeAfter[index] <= 0 || preview.MoraleAfter[index] <= 0) continue;
+            try
+            {
+                var application = applicationForTarget(index);
+                if (application is null || application.Value.EffectId <= 0 || application.Value.Chance <= 0) continue;
+                anyApplication = true;
+
+                var target = nativeTargets[index];
+                if (target is null)
+                {
+                    fullyModelled = false;
+                    notes.Add($"{source}: target {index} is unavailable.");
+                    continue;
+                }
+
+                var effect = GameModel.Instance.GetEffectById(application.Value.EffectId, false);
+                if (effect is null)
+                {
+                    fullyModelled = false;
+                    notes.Add($"{source}: effect {application.Value.EffectId} definition is unavailable.");
+                    continue;
+                }
+
+                if (target.hasImmunityForEffect(application.Value.EffectId))
+                {
+                    notes.Add($"{source}: effect {application.Value.EffectId} is blocked by target immunity.");
+                    continue;
+                }
+
+                var addedTurns = application.Value.AddedTurns > 0
+                    ? application.Value.AddedTurns
+                    : Math.Max(0, TryRead(() => effect.nbTurn));
+                if (addedTurns <= 0)
+                {
+                    fullyModelled = false;
+                    notes.Add($"{source}: effect {application.Value.EffectId} has no deterministic duration.");
+                    continue;
+                }
+
+                var currentTurnLeft = snapshots[index].Statuses
+                    .Where(status => status.EffectId == application.Value.EffectId)
+                    .Select(status => status.TurnLeft ?? 0)
+                    .DefaultIfEmpty(0)
+                    .Max();
+                var firstTickTurnLeft = currentTurnLeft + addedTurns;
+                var projectedTurns = Math.Min(2, firstTickTurnLeft);
+                if (projectedTurns <= 0) continue;
+
+                var remainingLife = preview.LifeAfter[index];
+                var remainingMorale = preview.MoraleAfter[index];
+                var appliedHealth = 0f;
+                var appliedMorale = 0f;
+
+                var fixedHealth = TryRead(() => effect.dmgPerTurn);
+                var healthPercent = TryRead(() => effect.dmgPercentPerTurn);
+                if (healthPercent > 0 && snapshots[index].MaxLife is { } maxLife) fixedHealth += maxLife * healthPercent / 100f;
+                var healthPerTurnLeft = TryRead(() => effect.dmgPerTurnLeft);
+                for (var step = 0; step < projectedTurns && remainingLife > 0; step++)
+                {
+                    var rawHealth = fixedHealth + healthPerTurnLeft * (firstTickTurnLeft - step);
+                    if (rawHealth <= 0) continue;
+                    var tick = DamageCalculator.CalculateDamages(target, actor, rawHealth, 1f, effect.elemType, 0f, 0f, null!, false, true);
+                    var reduction = HeroPassivesManager.CheckReduceDotFromHeroPassive(target, tick);
+                    var dealt = Math.Min(Math.Max(0f, tick - reduction), remainingLife);
+                    appliedHealth += dealt;
+                    remainingLife -= dealt;
+                }
+
+                var fixedMorale = TryRead(() => effect.moralePerTurn);
+                var moralePercent = TryRead(() => effect.moralePercentPerTurn);
+                if (moralePercent > 0 && snapshots[index].MaxMorale is { } maxMorale) fixedMorale += maxMorale * moralePercent / 100f;
+                var moralePerTurnLeft = TryRead(() => effect.moralePerTurnLeft);
+                for (var step = 0; step < projectedTurns && remainingMorale > 0; step++)
+                {
+                    var rawMorale = fixedMorale + moralePerTurnLeft * (firstTickTurnLeft - step);
+                    if (rawMorale <= 0) continue;
+                    var tick = DamageCalculator.CalculateMoraleDamages(target, actor, rawMorale, 1f, true, false);
+                    var dealt = Math.Min(Math.Max(0f, tick), remainingMorale);
+                    appliedMorale += dealt;
+                    remainingMorale -= dealt;
+                }
+
+                var directProgress = CalculateTargetFightProgress(snapshots[index], preview.LifeAfter[index], preview.MoraleAfter[index]);
+                var totalProgress = CalculateTargetFightProgress(snapshots[index], remainingLife, remainingMorale);
+                var chance = Math.Clamp(application.Value.Chance, 0f, 1f);
+                health += appliedHealth * chance;
+                morale += appliedMorale * chance;
+                progress += Math.Max(0f, totalProgress - directProgress) * 100f * chance;
+                if (chance >= 0.999f && remainingLife <= 0) kills++;
+                else if (chance >= 0.999f && remainingMorale <= 0) escapes++;
+                if (HasNonPeriodicEffectPayload(effect)) fullyModelled = false;
+            }
+            catch (Exception exception)
+            {
+                fullyModelled = false;
+                notes.Add($"{source}: periodic projection failed open ({exception.GetType().Name}).");
+            }
+        }
+
+        var reason = notes.Count == 0
+            ? (anyApplication ? $"{source}: projected deterministic periodic component." : null)
+            : string.Join(" ", notes.Distinct().Take(4));
+        return new(fullyModelled, health, morale, progress, kills, escapes, reason);
+    }
+
+    // A small, bounded setup horizon: when a deterministic status amplifies
+    // the damage our monsters deal to this hero, credit only the next two
+    // possible uses of the best different visible attack.  This captures
+    // Panic -> morale attacks (and the analogous damage-taken debuff) without
+    // simulating a speculative full fight.
+    private static StrategicSetupProjection ProjectFutureDamageAmplification(
+        AttackBar attackBar,
+        Attack setupAttack,
+        IReadOnlyList<Attack> availableAttacks,
+        Fighter actor,
+        Il2CppSystem.Collections.Generic.List<Fighter> nativeTargets,
+        IReadOnlyList<FighterDecisionSnapshot> snapshots,
+        NativeMonsterPreview preview)
+    {
+        var effectId = TryRead(() => setupAttack.effectId);
+        var chance = TryRead(() => setupAttack.effectChancePercent);
+        if (effectId <= 0 || chance is > 0 and < 100 || HasConditionalOrSecondaryEffectRoute(setupAttack))
+            return new(true, 0f, null);
+
+        Effect? effect;
+        try { effect = GameModel.Instance.GetEffectById(effectId, false); }
+        catch (Exception exception) { return new(false, 0f, $"Setup effect {effectId} could not be read: {exception.GetType().Name}."); }
+        if (effect is null) return new(false, 0f, $"Setup effect {effectId} definition is unavailable.");
+
+        var baseTurns = Math.Max(0, TryRead(() => setupAttack.nbEffectStack) > 0
+            ? TryRead(() => setupAttack.nbEffectStack)
+            : TryRead(() => effect.nbTurn));
+        if (baseTurns <= 0) return new(false, 0f, $"Setup effect {effectId} has no positive duration.");
+
+        var rawMoralePercent = TryRead(() => effect.moraleDmgBuffPercent);
+        var rawHealthPercent = TryRead(() => effect.damageTakenIncreasePercent);
+        var explicitMoraleMultiplier = TryRead(() => effect.moraleDmgMultiplied);
+        if (rawMoralePercent <= 0 && rawHealthPercent <= 0 && explicitMoraleMultiplier <= 1f)
+            return new(true, 0f, null);
+
+        var utility = 0f;
+        var notes = new List<string>();
+        var count = Math.Min(Math.Min(nativeTargets.Count, snapshots.Count), Math.Min(preview.LifeAfter.Count, preview.MoraleAfter.Count));
+        for (var index = 0; index < count; index++)
+        {
+            var target = nativeTargets[index];
+            if (target is null || preview.LifeAfter[index] <= 0 || preview.MoraleAfter[index] <= 0) continue;
+            try
+            {
+                if (target.hasImmunityForEffect(effectId))
+                {
+                    notes.Add($"setup effect {effectId} is blocked by immunity on {snapshots[index].Key}.");
+                    continue;
+                }
+
+                var addedTurns = baseTurns + target.GetAddEffectStackBonus(effectId, actor, false);
+                if (addedTurns <= 0) continue;
+                var currentTurns = snapshots[index].Statuses
+                    .Where(status => status.EffectId == effectId)
+                    .Select(status => status.TurnLeft ?? 0)
+                    .DefaultIfEmpty(0)
+                    .Max();
+                // Existing copies of the same debuff already create their
+                // own value.  Credit only turns extended by this action.
+                var usableFutureTurns = Math.Max(0, Math.Min(2, currentTurns + addedTurns) - Math.Min(2, currentTurns));
+                if (usableFutureTurns == 0) continue;
+
+                var moralePercent = rawMoralePercent;
+                if (TryRead(() => effect.moraleDmgBuffPercentByNbStack))
+                    moralePercent *= Math.Max(1, addedTurns);
+                if (explicitMoraleMultiplier > 1f)
+                    moralePercent = Math.Max(moralePercent, (explicitMoraleMultiplier - 1f) * 100f);
+
+                var perUseProgress = FindBestFutureAmplificationProgress(
+                    attackBar, availableAttacks, setupAttack, actor, target, snapshots[index],
+                    Math.Max(0f, rawHealthPercent) / 100f,
+                    Math.Max(0f, moralePercent) / 100f);
+                if (perUseProgress <= 0) continue;
+
+                utility += perUseProgress * usableFutureTurns;
+                notes.Add($"setup effect {effectId} grants {perUseProgress.ToString("0.##", CultureInfo.InvariantCulture)} progress per follow-up for {usableFutureTurns} target turn(s) on {snapshots[index].Key}.");
+            }
+            catch (Exception exception)
+            {
+                notes.Add($"setup effect {effectId} skipped {snapshots[index].Key}: {exception.GetType().Name}.");
+            }
+        }
+
+        var reason = notes.Count == 0 ? null : string.Join(" ", notes.Take(4));
+        // The exact direct follow-up values come from the game preview.  The
+        // only uncertainty is the bounded number of future actor turns.
+        return new(!HasNonPeriodicEffectPayload(effect), utility, reason);
+    }
+
+    private static float FindBestFutureAmplificationProgress(
+        AttackBar attackBar,
+        IReadOnlyList<Attack> availableAttacks,
+        Attack setupAttack,
+        Fighter actor,
+        Fighter setupTarget,
+        FighterDecisionSnapshot setupSnapshot,
+        float healthMultiplier,
+        float moraleMultiplier)
+    {
+        var best = 0f;
+        var setupId = TryRead(() => setupAttack.id);
+        for (var attackIndex = 0; attackIndex < availableAttacks.Count; attackIndex++)
+        {
+            var followUp = availableAttacks[attackIndex];
+            if (followUp is null || TryRead(() => followUp.id) == setupId) continue;
+            try
+            {
+                var targets = attackBar.GetTargetsForAttack(followUp, true);
+                if (targets is null || targets.Count == 0) continue;
+                var snapshots = ReadFighters(targets, TryRead(() => followUp.elemType.ToString()));
+                if (!TryReadNativeMonsterPreview(attackBar, followUp, actor, targets, snapshots, out var preview, out _))
+                    continue;
+
+                var count = Math.Min(Math.Min(targets.Count, snapshots.Count), Math.Min(preview.LifeAfter.Count, preview.MoraleAfter.Count));
+                for (var index = 0; index < count; index++)
+                {
+                    var target = targets[index];
+                    if (target is null || TryRead(() => target.position) != TryRead(() => setupTarget.position)) continue;
+
+                    var healthDamage = snapshots[index].Life is { } beforeLife
+                        ? Math.Max(0f, beforeLife - preview.LifeAfter[index])
+                        : 0f;
+                    var moraleDamage = snapshots[index].Morale is { } beforeMorale
+                        ? Math.Max(0f, beforeMorale - preview.MoraleAfter[index])
+                        : 0f;
+                    // A direct follow-up that already ends an axis gains no
+                    // extra current-fight value from amplifying that axis.
+                    if (preview.LifeAfter[index] <= 0) healthDamage = 0f;
+                    if (preview.MoraleAfter[index] <= 0) moraleDamage = 0f;
+
+                    var healthProgress = setupSnapshot.Life is > 0
+                        ? Math.Min(healthDamage * healthMultiplier, preview.LifeAfter[index]) / setupSnapshot.Life.Value
+                        : 0f;
+                    var moraleProgress = setupSnapshot.Morale is > 0
+                        ? Math.Min(moraleDamage * moraleMultiplier, preview.MoraleAfter[index]) / setupSnapshot.Morale.Value
+                        : 0f;
+                    best = Math.Max(best, Math.Max(healthProgress, moraleProgress) * 100f);
+                }
+            }
+            catch
+            {
+                // A missing preview for a possible follow-up is simply not
+                // credited; it must never make a setup action look better.
+            }
+        }
+
+        return best;
     }
 
     private static bool HasConditionalOrSecondaryEffectRoute(Attack attack)
@@ -774,6 +1164,9 @@ internal static class DecisionDryRun
         ActionCandidate candidate,
         NativeMonsterPreview preview,
         EffectProjection effectProjection,
+        EffectProjection passiveProjection,
+        EffectProjection artefactProjection,
+        StrategicSetupProjection setupProjection,
         ExistingPeriodicDefeatProjection existingDefeats,
         FutureTrapDefeatProjection futureTrapDefeats,
         DodgeConsumptionProjection dodgeConsumption)
@@ -793,20 +1186,20 @@ internal static class DecisionDryRun
         // therefore comparable on the same health/morale finish axes; no
         // legacy 0.25 morale discount is applied to AUTO.
         var allTargetsAlreadyResolved = candidate.Targets.Count > 0 && candidate.Targets.All(target => resolvedTargetKeys.Contains(target.Key));
-        var projectedEffectUtility = allTargetsAlreadyResolved ? 0f : effectProjection.HealthDamage + effectProjection.MoraleDamage;
+        var projectedEffectUtility = allTargetsAlreadyResolved ? 0f : effectProjection.ProgressUtility + passiveProjection.ProgressUtility + artefactProjection.ProgressUtility + setupProjection.Utility;
         // Removing a combatant is the clearest way to shorten the current
         // fight.  The direct native preview and the bounded periodic forecast
         // both contribute, while ordinary non-lethal damage remains the next
         // comparison criterion.
         var immediateDefeats = CountImmediateDefeatsExcludingExistingPeriodicDefeats(candidate.Targets, preview, resolvedTargetKeys);
-        var killTieBreak = (immediateDefeats.Kills + (allTargetsAlreadyResolved ? 0 : effectProjection.Kills)) * 5000f;
-        var escapeTieBreak = (immediateDefeats.Escapes + (allTargetsAlreadyResolved ? 0 : effectProjection.Escapes)) * 5000f;
+        var killTieBreak = (immediateDefeats.Kills + (allTargetsAlreadyResolved ? 0 : effectProjection.Kills + passiveProjection.Kills + artefactProjection.Kills)) * 5000f;
+        var escapeTieBreak = (immediateDefeats.Escapes + (allTargetsAlreadyResolved ? 0 : effectProjection.Escapes + passiveProjection.Escapes + artefactProjection.Escapes)) * 5000f;
         // Immediate combat output is always replaced by the game's own live
         // preview.  In particular, do not keep the former guessed status
         // score: an unknown secondary effect is worth zero to the planner,
         // never a fabricated bonus and never a reason to stop AUTO.
         var utility = healthUtility + moraleUtility + projectedEffectUtility + dodgeConsumption.Utility + killTieBreak + escapeTieBreak;
-        var hasKnownPeriodicComponent = effectProjection.HealthDamage > 0 || effectProjection.MoraleDamage > 0 || effectProjection.Kills > 0 || effectProjection.Escapes > 0;
+        var hasKnownPeriodicComponent = effectProjection.ProgressUtility > 0 || passiveProjection.ProgressUtility > 0 || artefactProjection.ProgressUtility > 0 || effectProjection.Kills > 0 || effectProjection.Escapes > 0 || passiveProjection.Kills > 0 || passiveProjection.Escapes > 0 || artefactProjection.Kills > 0 || artefactProjection.Escapes > 0;
         var supported = score.SupportedEffectFamilies.Append("native-monster-preview");
         if (hasKnownPeriodicComponent)
         {
@@ -815,6 +1208,14 @@ internal static class DecisionDryRun
         var effectWarning = candidate.Action.EffectId is > 0
             ? effectProjection.Reason ?? "The primary effect has no separately scoreable future-turn component; its game application remains intact."
             : "This attack has no applied primary effect; direct values come from the native preview.";
+        if (passiveProjection.ProgressUtility > 0 || passiveProjection.Kills > 0 || passiveProjection.Escapes > 0)
+            supported = supported.Append(passiveProjection.FullyModelled ? "verified-monster-passive-periodic-effect" : "known-monster-passive-periodic-component");
+        if (artefactProjection.ProgressUtility > 0 || artefactProjection.Kills > 0 || artefactProjection.Escapes > 0)
+            supported = supported.Append(artefactProjection.FullyModelled ? "verified-artefact-morale-status" : "known-artefact-morale-status");
+        if (setupProjection.Utility > 0)
+            supported = supported.Append(setupProjection.FullyModelled ? "two-turn-damage-amplification" : "known-two-turn-damage-amplification");
+        effectWarning = string.Join(" ", new[] { effectWarning, passiveProjection.Reason, artefactProjection.Reason, setupProjection.Reason }
+            .Where(message => !string.IsNullOrWhiteSpace(message)).Distinct());
         return candidate with
         {
             Score = score with
@@ -835,7 +1236,7 @@ internal static class DecisionDryRun
                 // to have invented a value for an unmodelled status.
                 Confidence = candidate.ConditionsNotMet.Count == 0 && futureTrapDefeats.TargetKeys.Count == 0 ? DecisionConfidence.HIGH : DecisionConfidence.MEDIUM,
                 SupportedEffectFamilies = (futureTrapDefeats.TargetKeys.Count > 0 ? supported.Append("one-room-trap-horizon") : supported).Append(dodgeConsumption.TargetCount > 0 ? "area-dodge-consumption" : string.Empty).Where(family => !string.IsNullOrWhiteSpace(family)).Distinct().ToArray(),
-                Warnings = score.Warnings.Append("Direct damage and morale are summed over every target from the game's native AttackBar preview.").Append("Unmodelled effects contribute zero strategic utility but do not block the native action.").Append(effectWarning).Concat(existingDefeats.Notes).Concat(futureTrapDefeats.Notes).Append(dodgeConsumption.Reason ?? string.Empty).Where(message => !string.IsNullOrWhiteSpace(message)).Distinct().ToArray(),
+                Warnings = score.Warnings.Append("Direct damage and morale are summed over every target from the game's native AttackBar preview.").Append("Only unverified effect branches contribute zero strategic utility; verified periodic, passive, artefact and two-turn setup value is included.").Append(effectWarning).Concat(existingDefeats.Notes).Concat(futureTrapDefeats.Notes).Append(dodgeConsumption.Reason ?? string.Empty).Where(message => !string.IsNullOrWhiteSpace(message)).Distinct().ToArray(),
                 Notes = score.Notes.Append($"native-monster-preview targets={preview.TargetCount} healthDamage={preview.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={preview.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} healthProgress={progress.HealthUtility.ToString("0.##", CultureInfo.InvariantCulture)} moraleProgress={progress.MoraleUtility.ToString("0.##", CultureInfo.InvariantCulture)} kills={immediateDefeats.Kills} escapes={immediateDefeats.Escapes} existingPeriodicDefeats={existingDefeats.TargetKeys.Count} futureTrapDefeats={futureTrapDefeats.TargetKeys.Count}").Append($"two-target-turn-effect healthDamage={effectProjection.HealthDamage.ToString("0.##", CultureInfo.InvariantCulture)} moraleDamage={effectProjection.MoraleDamage.ToString("0.##", CultureInfo.InvariantCulture)} kills={effectProjection.Kills} escapes={effectProjection.Escapes} fullyModelled={effectProjection.FullyModelled} futureTrapLifeKills={futureTrapDefeats.LifeKills} futureTrapMoraleEscapes={futureTrapDefeats.MoraleEscapes} dodgeConsumptionUtility={dodgeConsumption.Utility.ToString("0.##", CultureInfo.InvariantCulture)}").ToArray(),
             },
         };
@@ -860,6 +1261,12 @@ internal static class DecisionDryRun
         return (kills, escapes);
     }
 
+    private static float CalculateTargetFightProgress(FighterDecisionSnapshot target, float lifeAfter, float moraleAfter)
+    {
+        var health = target.Life is > 0 ? Math.Clamp((target.Life.Value - lifeAfter) / target.Life.Value, 0f, 1f) : 0f;
+        var morale = target.Morale is > 0 ? Math.Clamp((target.Morale.Value - moraleAfter) / target.Morale.Value, 0f, 1f) : 0f;
+        return Math.Max(health, morale);
+    }
     // A hero leaves the fight through either zero life or zero morale.  Raw
     // values are not comparable (for example 40 morale against 80 remaining
     // morale can be better than 50 HP against 200 remaining HP), so choose
@@ -867,6 +1274,7 @@ internal static class DecisionDryRun
     // Summing those per-hero fractions also makes an AOE spell comparable to
     // a single-target spell without hard-coding any monster or hero name.
     private static CurrentFightProgress CalculateCurrentFightProgress(
+
         IReadOnlyList<FighterDecisionSnapshot> targets,
         IReadOnlyList<float> lifeAfter,
         IReadOnlyList<float> moraleAfter,

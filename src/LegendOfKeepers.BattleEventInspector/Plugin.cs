@@ -17,7 +17,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "zubko.legendofkeepers.battleeventinspector";
     public const string PluginName = "LegendOfKeepers.BattleEventInspector";
-    public const string PluginVersion = "0.6.30";
+    public const string PluginVersion = "0.6.31";
     private const string HarmonyId = "zubko.legendofkeepers.battleeventinspector.harmony";
 
     private Harmony? _harmony;

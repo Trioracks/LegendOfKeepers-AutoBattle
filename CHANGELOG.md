@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.31
+
+- Reworked monster AUTO's periodic-effect utility into target-relative progress on the faster defeat axis (health or morale). A morale DoT can now correctly outrank raw health damage when it brings heroes closer to fleeing.
+- Added a bounded forecast for deterministic periodic statuses supplied by a monster passive, including the target's live immunity and status-stack modifier.
+- Added expected per-hero periodic value for active artefacts that can apply a status after a monster morale attack; AOE attacks receive that value for every hero actually affected by morale damage.
+- Added a two-target-turn setup forecast for deterministic effects that amplify later monster health or morale damage, so a Panic-style setup can be preferred before its stronger follow-up.
+- Unsupported, conditional, random, or unresolved branches still fail open and receive no invented strategic value.
+
 ## v0.6.30
 
 - Added a conservative one-room trap horizon for monster AUTO. When the next room is a fully known normal AOE trap, AUTO can leave a hero alive only if that trap deterministically defeats the hero.

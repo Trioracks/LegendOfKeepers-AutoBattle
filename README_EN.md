@@ -8,8 +8,8 @@ AUTO toggle in the upper-right corner of combat.
 
 ## Download
 
-Download `LegendOfKeepers_AutoBattle_v0.6.30_TESTERS.zip` from the
-[v0.6.30 release](https://github.com/Trioracks/LegendOfKeepers-AutoBattle/releases/tag/v0.6.30).
+Download `LegendOfKeepers_AutoBattle_v0.6.31_TESTERS.zip` from the
+[v0.6.31 release](https://github.com/Trioracks/LegendOfKeepers-AutoBattle/releases/tag/v0.6.31).
 
 This is a test build. It does not contain the game, Steam, saves, or original
 game DLLs.
@@ -27,6 +27,20 @@ The priority uses the game's live previews of health damage, morale damage,
 targets, area effects, resistance, and current statuses. The mod does not
 simulate mouse input and does not launch attacks, spells, or disasters
 directly.
+
+### New in v0.6.31: status, passive, and artefact synergy
+
+AUTO now compares periodic health and morale effects as progress toward the
+target's actual defeat path, rather than as raw incompatible numbers. It
+models a deterministic periodic status applied by a monster passive (such as
+Bleeding), and the expected per-target periodic status from active artefacts
+that trigger on monster morale attacks.
+
+A short, two-target-turn setup horizon also values a deterministic debuff that
+amplifies later monster damage. This lets a Panic-style morale-vulnerability
+setup compete fairly with an immediate hit. Immunity, application chance, live
+target routing, and the game preview are used; unsupported branches still
+receive no guessed value.
 
 ### New in v0.6.30: one-room trap horizon
 
@@ -76,7 +90,7 @@ not part of the game.
 
 ## Technical details
 
-- Plugin version: `0.6.30`
+- Plugin version: `0.6.31`
 - GUID: `zubko.legendofkeepers.battleeventinspector`
 - BepInEx IL2CPP x86: `6.0.0-be.785`
 - Target Unity version: `2019.4.18f1`
