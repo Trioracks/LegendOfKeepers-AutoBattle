@@ -34,6 +34,11 @@ internal readonly record struct EffectProjection(bool FullyModelled, float Healt
 internal readonly record struct StrategicSetupProjection(bool FullyModelled, float Utility, string? Reason);
 internal readonly record struct PeriodicEffectApplication(int EffectId, int AddedTurns, float Chance, string Source);
 // A target included here is already guaranteed to die or flee when its
+// A status forecast is allowed only when the corresponding action branch can
+// be established from the current native state. It is deliberately separate
+// from the direct attack preview: the game remains authoritative for
+// current-turn damage, morale and target routing.
+internal readonly record struct PrimaryEffectCondition(bool CanForecast, bool Applies, string? Reason);
 // currently active deterministic effects tick.  It is intentionally a
 // conservative set: unknown, random, conditional and non-periodic statuses
 // are never allowed to make AUTO abandon a target.
@@ -297,6 +302,7 @@ internal static class DecisionDryRun
 
     private static ActionCandidate BuildMonsterAttackCandidate(DecisionContext baseContext, FightManager manager, AttackBar attackBar, Fighter actor, Attack attack, IReadOnlyList<Attack> availableAttacks)
     {
+        AttackConditionAudit.ObserveGameDatabase();
         var descriptor = DescribeAttack(attack);
         // Do not reject a visible action merely because its target routing is
         // random or bounces.  The game owns that routing, and the native tile
@@ -320,7 +326,7 @@ internal static class DecisionDryRun
         var context = baseContext with
         {
             Targets = targets,
-            TargetResolution = "native-AttackBar.GetTargetsForAttack(attack, true); deterministic targets only",
+            TargetResolution = "native-AttackBar.GetTargetsForAttack(attack, true); game-validated target route and bounce conditions",
         };
         var candidate = BuildCandidate(context, descriptor, targets, "native-preview-resolver", targetsKnown: true);
         if (nativeTargets is null || targets.Count == 0)
@@ -340,7 +346,8 @@ internal static class DecisionDryRun
         var artefactProjection = ProjectMoraleAttackArtefactEffects(attack, actor, nativeTargets, targets, preview);
         var setupProjection = ProjectFutureDamageAmplification(attackBar, attack, availableAttacks, actor, nativeTargets, targets, preview);
         var dodgeConsumption = ProjectAreaDodgeConsumption(nativeTargets, targets, preview);
-        return ApplyNativeMonsterPreview(candidate, preview, effectProjection, passiveProjection, artefactProjection, setupProjection, existingDefeats, futureTrapDefeats, dodgeConsumption);
+        var conditionEvidence = DescribeNativeConditionEvidence(attack, nativeTargets, targets);
+        return ApplyNativeMonsterPreview(candidate, preview, effectProjection, passiveProjection, artefactProjection, setupProjection, existingDefeats, futureTrapDefeats, dodgeConsumption, conditionEvidence);
     }
 
     private static bool TryReadNativeMonsterPreview(
@@ -553,8 +560,9 @@ internal static class DecisionDryRun
     }
 
     // Forecast only the exact periodic fields that the engine's HandleEffect
-    // consumes.  It deliberately models at most the affected hero's next two
-    // turns; conditional malus synergies, control, and RNG remain manual.
+    // consumes. It deliberately models at most the affected hero's next two
+    // turns; readable deterministic gates are checked against live state,
+    // while control and RNG remain non-speculative.
     private static EffectProjection ProjectPrimaryEffectOverTwoTargetTurns(
         Attack attack,
         Fighter actor,
@@ -565,14 +573,6 @@ internal static class DecisionDryRun
         var effectId = TryRead(() => attack.effectId);
         if (effectId <= 0) return new(true, 0, 0, 0, 0, 0, null);
 
-        // A primary status can only be treated as deterministic when it is
-        // the whole status payload of the action.  Conditional and secondary
-        // routing is intentionally left manual until each route has its own
-        // current-battle evaluator.
-        if (HasConditionalOrSecondaryEffectRoute(attack))
-        {
-            return new(false, 0, 0, 0, 0, 0, $"Attack {TryRead(() => attack.id)} has a secondary or conditional effect route.");
-        }
 
         var chance = TryRead(() => attack.effectChancePercent);
         if (chance is > 0 and < 100)
@@ -607,6 +607,7 @@ internal static class DecisionDryRun
         var artefactOrPassiveStackTargets = 0;
         var distinctPassiveEffectTargets = 0;
         var count = Math.Min(Math.Min(nativeTargets.Count, snapshots.Count), preview.LifeAfter.Count);
+        var inactiveConditionalTargets = 0;
         for (var index = 0; index < count; index++)
         {
             if (preview.LifeAfter[index] <= 0) continue;
@@ -615,6 +616,15 @@ internal static class DecisionDryRun
             try
             {
                 // This is the same target-side gate used by Fighter.AddEffect.
+                var condition = ResolvePrimaryEffectCondition(attack, target, snapshots[index]);
+                if (!condition.CanForecast)
+                    return new(false, health, morale, progressUtility, kills, escapes, condition.Reason);
+                if (!condition.Applies)
+                {
+                    inactiveConditionalTargets++;
+                    continue;
+                }
+
                 // A hero that is immune to Bleeding/Poison/etc. must receive
                 // zero future-turn value from that status.
                 if (target.hasImmunityForEffect(effectId))
@@ -702,6 +712,7 @@ internal static class DecisionDryRun
                 var projectedProgress = CalculateTargetFightProgress(snapshots[index], remainingLife, remainingMorale);
                 // Do not compare raw health and morale values.  Credit only
                 // the additional depletion of the target's faster exit axis.
+                progressUtility += Math.Max(0f, projectedProgress - directProgress) * 100f;
             }
             catch (Exception exception)
             {
@@ -709,8 +720,8 @@ internal static class DecisionDryRun
             }
         }
 
-        var hasUnmodelledPayload = HasNonPeriodicEffectPayload(effect) || distinctPassiveEffectTargets > 0;
-        var modifierSummary = $" immuneTargets={immuneTargets} matchingPassiveStackTargets={passiveStackTargets} stackModifierTargets={artefactOrPassiveStackTargets} distinctPassiveEffectTargets={distinctPassiveEffectTargets}.";
+        var hasUnmodelledPayload = HasNonPeriodicEffectPayload(effect) || distinctPassiveEffectTargets > 0 || TryRead(() => attack.effectId2) > 0;
+        var modifierSummary = $" inactiveConditionalTargets={inactiveConditionalTargets} immuneTargets={immuneTargets} matchingPassiveStackTargets={passiveStackTargets} stackModifierTargets={artefactOrPassiveStackTargets} distinctPassiveEffectTargets={distinctPassiveEffectTargets}.";
         if (health == 0 && morale == 0)
         {
             var immunityReason = immuneTargets > 0 ? $" Effect {effectId} is blocked by target immunity." : string.Empty;
@@ -721,8 +732,108 @@ internal static class DecisionDryRun
     }
 
     // Monster passives are evaluated by the game for the concrete native
-    // target route.  A different passive status (for example Vampire's
-    // Bleeding) used to be logged but assigned zero utility.  Forecast its
+    // BodyElement gates an attack's status branch before calling Fighter.AddEffect.
+    // Mirror only deterministic, readable gates. Unknown slow checks or RNG
+    // receive no future status utility; they never alter the game's native
+    // current-turn preview or block the visible tile callback.
+    private static PrimaryEffectCondition ResolvePrimaryEffectCondition(Attack attack, Fighter target, FighterDecisionSnapshot snapshot)
+    {
+        try
+        {
+            if (attack.effectChanceForStunedWhenSlowed > 0 || attack.effectIfTargetHasSlowedAboveCheck)
+                return new(false, false, $"Attack {attack.id} has a slow-dependent or random status branch that is not forecast.");
+
+            if (attack.effectIfNbMalusOnTargetGreaterOrEqual > 0)
+            {
+                var required = attack.effectIfNbMalusOnTargetGreaterOrEqual;
+                var actual = target.GetNbMalus();
+                if (actual < required)
+                    return new(true, false, $"primary-effect-malus-condition target={snapshot.Key} actual={actual} required={required}");
+            }
+
+            if (attack.effectIfTargetHasArmorUnderCheck)
+            {
+                if (!snapshot.Armor.HasValue)
+                    return new(false, false, $"Attack {attack.id} needs target armour, which is unavailable.");
+                if (snapshot.Armor.Value >= attack.effectIfTargetHasArmorUnder)
+                    return new(true, false, $"primary-effect-armour-condition target={snapshot.Key} armour={snapshot.Armor.Value.ToString("0.##", CultureInfo.InvariantCulture)} threshold={attack.effectIfTargetHasArmorUnder.ToString("0.##", CultureInfo.InvariantCulture)}");
+            }
+
+            if (attack.effectIfTargetHasMoralGreaterPercentCheck)
+            {
+                if (snapshot.Morale is not { } morale || snapshot.MaxMorale is not { } maxMorale || maxMorale <= 0)
+                    return new(false, false, $"Attack {attack.id} needs target morale percent, which is unavailable.");
+                var actualPercent = morale * 100f / maxMorale;
+                if (actualPercent <= attack.effectIfTargetHasMoralGreaterPercent)
+                    return new(true, false, $"primary-effect-morale-condition target={snapshot.Key} actual={actualPercent.ToString("0.##", CultureInfo.InvariantCulture)} threshold={attack.effectIfTargetHasMoralGreaterPercent.ToString("0.##", CultureInfo.InvariantCulture)}");
+            }
+
+            if (attack.applyEffectIfLauncherHasShieldGreaterOrEqual > 0)
+            {
+                var manager = DungeonMain.instance?.fightManager;
+                if (manager is null)
+                    return new(false, false, $"Attack {attack.id} needs launcher shield, which is unavailable.");
+                var shield = manager.launcherShield;
+                if (shield < attack.applyEffectIfLauncherHasShieldGreaterOrEqual)
+                    return new(true, false, $"primary-effect-shield-condition launcherShield={shield.ToString("0.##", CultureInfo.InvariantCulture)} threshold={attack.applyEffectIfLauncherHasShieldGreaterOrEqual.ToString("0.##", CultureInfo.InvariantCulture)}");
+            }
+
+            return new(true, true, null);
+        }
+        catch (Exception exception)
+        {
+            return new(false, false, $"Attack {TryRead(() => attack.id)} primary effect condition could not be read: {exception.GetType().Name}.");
+        }
+    }
+
+    // Direct conditional payloads, such as bonus damage against Frostbite,
+    // are calculated by AttackBar's own preview. Record the live conditions
+    // so a log can distinguish an inactive requirement from an AUTO issue.
+    private static IReadOnlyList<string> DescribeNativeConditionEvidence(
+        Attack attack,
+        Il2CppSystem.Collections.Generic.List<Fighter> nativeTargets,
+        IReadOnlyList<FighterDecisionSnapshot> snapshots)
+    {
+        var notes = new List<string>();
+        try
+        {
+            var count = Math.Min(nativeTargets.Count, snapshots.Count);
+            if (attack.dmgBonusOnTargetWithEffectId > 0)
+            {
+                var active = Enumerable.Range(0, count).Count(index => nativeTargets[index] is not null && nativeTargets[index].HasEffect(attack.dmgBonusOnTargetWithEffectId));
+                notes.Add($"native-condition damage-on-effect id={attack.dmgBonusOnTargetWithEffectId} activeTargets={active}/{count}");
+            }
+            if (attack.effectIdToDoubleOnTarget > 0)
+            {
+                var active = Enumerable.Range(0, count).Count(index => nativeTargets[index] is not null && nativeTargets[index].HasEffect(attack.effectIdToDoubleOnTarget));
+                notes.Add($"native-condition double-effect id={attack.effectIdToDoubleOnTarget} activeTargets={active}/{count}");
+            }
+            if (attack.effectIfNbMalusOnTargetGreaterOrEqual > 0)
+            {
+                var required = attack.effectIfNbMalusOnTargetGreaterOrEqual;
+                var values = Enumerable.Range(0, count).Where(index => nativeTargets[index] is not null).Select(index => $"{snapshots[index].Key}:{nativeTargets[index].GetNbMalus()}");
+                notes.Add($"native-condition target-maluses required={required} observed=[{string.Join(",", values)}]");
+            }
+            if (attack.effectIfTargetHasArmorUnderCheck)
+                notes.Add($"native-condition target-armour-under threshold={attack.effectIfTargetHasArmorUnder.ToString("0.##", CultureInfo.InvariantCulture)}");
+            if (attack.effectIfTargetHasMoralGreaterPercentCheck)
+                notes.Add($"native-condition target-morale-greater-percent threshold={attack.effectIfTargetHasMoralGreaterPercent.ToString("0.##", CultureInfo.InvariantCulture)}");
+            if (attack.effectIfTargetHasSlowedAboveCheck || attack.effectChanceForStunedWhenSlowed > 0)
+                notes.Add("native-condition slow-dependent status branch remains RNG/manual for future-turn value");
+            if (attack.effectId2 > 0)
+                notes.Add($"native-condition secondary-effect id={attack.effectId2} is applied by the game; only independently verified periodic primary value is forecast");
+        }
+        catch (Exception exception)
+        {
+            notes.Add($"native-condition-evidence unavailable: {exception.GetType().Name}");
+        }
+
+        return notes;
+    }
+
+    // Monster passives are evaluated by the game for the concrete native
+    // target route. A different passive status (for example Vampire's
+    // Bleeding) used to be logged but assigned zero utility. Forecast its
     // deterministic periodic part separately instead of pretending it is the
     // visible primary effect.
     private static EffectProjection ProjectDistinctMonsterPassiveEffectsOverTwoTargetTurns(
@@ -1169,7 +1280,8 @@ internal static class DecisionDryRun
         StrategicSetupProjection setupProjection,
         ExistingPeriodicDefeatProjection existingDefeats,
         FutureTrapDefeatProjection futureTrapDefeats,
-        DodgeConsumptionProjection dodgeConsumption)
+        DodgeConsumptionProjection dodgeConsumption,
+        IReadOnlyList<string> conditionEvidence)
     {
         var score = candidate.Score;
         // Damage dealt to a hero that will deterministically die or flee from
@@ -1208,6 +1320,8 @@ internal static class DecisionDryRun
         var effectWarning = candidate.Action.EffectId is > 0
             ? effectProjection.Reason ?? "The primary effect has no separately scoreable future-turn component; its game application remains intact."
             : "This attack has no applied primary effect; direct values come from the native preview.";
+        if (conditionEvidence.Count > 0)
+            effectWarning = string.Join(" ", new[] { effectWarning }.Concat(conditionEvidence));
         if (passiveProjection.ProgressUtility > 0 || passiveProjection.Kills > 0 || passiveProjection.Escapes > 0)
             supported = supported.Append(passiveProjection.FullyModelled ? "verified-monster-passive-periodic-effect" : "known-monster-passive-periodic-component");
         if (artefactProjection.ProgressUtility > 0 || artefactProjection.Kills > 0 || artefactProjection.Escapes > 0)
