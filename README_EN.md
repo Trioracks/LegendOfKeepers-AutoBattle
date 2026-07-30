@@ -8,8 +8,8 @@ AUTO toggle in the upper-right corner of combat.
 
 ## Download
 
-Download `LegendOfKeepers_AutoBattle_v0.6.31_TESTERS.zip` from the
-[v0.6.31 release](https://github.com/Trioracks/LegendOfKeepers-AutoBattle/releases/tag/v0.6.31).
+Download `LegendOfKeepers_AutoBattle_v0.6.33_TESTERS.zip` from the
+[v0.6.33 release](https://github.com/Trioracks/LegendOfKeepers-AutoBattle/releases/tag/v0.6.33).
 
 This is a test build. It does not contain the game, Steam, saves, or original
 game DLLs.
@@ -28,9 +28,29 @@ targets, area effects, resistance, and current statuses. The mod does not
 simulate mouse input and does not launch attacks, spells, or disasters
 directly.
 
-### New in v0.6.31: status, passive, and artefact synergy
+### New in v0.6.33: automatic updates and condition-aware attacks
+
+After this one-time ZIP install, the mod checks the official GitHub release on
+later normal launches. If a newer version is available, a visible notice names
+it, explains the restart, counts down for six seconds, and offers **Update
+now** or **Skip this version**. The updater then closes the game, verifies the
+downloaded ZIP and plugin DLL with published SHA-256 values, replaces only the
+mod DLL, and restarts Legend of Keepers. No manual download, extraction, or
+file replacement is needed for future mod releases.
+
+Network, manifest, integrity, and updater errors fail open: the installed DLL
+is left untouched and the game starts normally. The helper log is
+`BepInEx\\LogOutput.AutoUpdate.log`.
+
+Monster AUTO also uses the game's native preview for condition-dependent
+damage and eligible bounce routes. Its deterministic primary status forecast
+checks live malus count, armour, morale, and launcher-shield requirements;
+inactive branches receive no made-up future value.
+
 
 AUTO now compares periodic health and morale effects as progress toward the
+### New in v0.6.31: status, passive, and artefact synergy
+
 target's actual defeat path, rather than as raw incompatible numbers. It
 models a deterministic periodic status applied by a monster passive (such as
 Bleeding), and the expected per-target periodic status from active artefacts
@@ -63,9 +83,12 @@ open: the hero remains a current-fight target.
 4. Launch the game normally with Steam's **Play** button. No separate launcher
    is required.
 
-To update, close the game, extract the newer package contents into the same
-folder, and accept the file replacement/merge prompt. Saves and original game
-files are not included in the package.
+Future updates are automatic. Keep launching normally from Steam. When a new
+release exists, the updater shows a visible six-second notice, then closes and
+restarts the game itself after SHA-256 verification. You can choose **Skip
+this version** if you want to stay on the installed build. The updater replaces
+only `BepInEx\\plugins\\LegendOfKeepers.BattleEventInspector\\LegendOfKeepers.BattleEventInspector.dll`;
+saves and original game files are never included or replaced.
 
 The bright AUTO icon means ON; the dim icon means OFF. Turning AUTO off stops
 future choices immediately. An action already accepted by the game can finish
@@ -90,7 +113,12 @@ not part of the game.
 
 ## Technical details
 
-- Plugin version: `0.6.31`
+- Plugin version: `0.6.33`
 - GUID: `zubko.legendofkeepers.battleeventinspector`
 - BepInEx IL2CPP x86: `6.0.0-be.785`
 - Target Unity version: `2019.4.18f1`
+
+## Support the author
+
+If the mod saves you time and you would like to support further work, you can
+do so on [Boosty](https://boosty.to/gobelen).

@@ -1,6 +1,15 @@
 # Changelog
 
 ## v0.6.31
+## v0.6.33
+
+- Added an opt-out automatic updater. After the one-time ZIP install, a normal game launch checks the fixed official GitHub release manifest. A visible countdown notice explains the automatic restart and offers **Update now** or **Skip this version**.
+- The updater waits for the game process, downloads a fixed release asset over HTTPS, verifies the archive and DLL SHA-256 values, replaces only the AUTO Battle plugin DLL, and restarts the game. Network, manifest, integrity, or helper failures leave the installed DLL untouched and start the game normally.
+- Added `BepInEx\\LogOutput.AutoUpdate.log` for the external updater and a per-version suppression state to prevent a failed or skipped release from causing a restart loop.
+- Monster AUTO now uses the game's native previews for direct condition-dependent damage and target routes, including effect-gated bonus damage and eligible bounce routes.
+- Deterministic primary status gates now verify live target malus count, strict armour threshold, morale percentage, and launcher shield before assigning two-turn periodic value. Inactive gates receive no speculative value.
+- Added a read-only audit of the loaded `Attack` database so future condition/synergy support follows the exact game build rather than localized tooltip text.
+
 
 - Reworked monster AUTO's periodic-effect utility into target-relative progress on the faster defeat axis (health or morale). A morale DoT can now correctly outrank raw health damage when it brings heroes closer to fleeing.
 - Added a bounded forecast for deterministic periodic statuses supplied by a monster passive, including the target's live immunity and status-stack modifier.

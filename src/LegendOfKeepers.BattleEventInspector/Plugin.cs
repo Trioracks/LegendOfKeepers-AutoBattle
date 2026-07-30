@@ -17,7 +17,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "zubko.legendofkeepers.battleeventinspector";
     public const string PluginName = "LegendOfKeepers.BattleEventInspector";
-    public const string PluginVersion = "0.6.32";
+    public const string PluginVersion = "0.6.33";
     private const string HarmonyId = "zubko.legendofkeepers.battleeventinspector.harmony";
 
     private Harmony? _harmony;
@@ -26,6 +26,12 @@ public sealed class Plugin : BasePlugin
     {
         try
         {
+            // A pending update is handled before the combat hooks are
+            // installed. The helper displays its own notice, waits for this
+            // process to exit, verifies the release package and restarts the
+            // game; this current plugin must do no further work on that run.
+            if (AutoUpdateService.TryScheduleUpdate(Log)) return;
+
             var settings = InspectorSettings.Load();
             ActionStateInspector.Initialize(Log, settings);
             DeferredGroupEffectInspector.Initialize(settings);
